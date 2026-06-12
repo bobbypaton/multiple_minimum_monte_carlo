@@ -91,6 +91,7 @@ class ConformerEnsemble:
         parallel_batch_folder_location: Optional[str] = None,
         process_timeout: Optional[float] = 3600,
         step_callback: Optional[Callable] = None,
+        fixed_bonds: Optional[List[Tuple[int, int]]] = None,
     ) -> None:
         """Initialize the conformer ensemble generator.
 
@@ -173,6 +174,12 @@ class ConformerEnsemble:
                 callback returns a truthy value, the Monte Carlo search stops
                 early. Useful for progress reporting and convergence-based
                 stopping. Default is None.
+            fixed_bonds: Optional list of central-bond atom-index pairs (0-based)
+                to exclude from the rotatable dihedral list. A torsion is dropped
+                if its central b-c bond matches one of these pairs (in either
+                order). Unlike constrained_atoms, the atoms are still free to
+                relax during optimization; only the random rotation is skipped.
+                Default is None.
         """
         self.conformer = conformer
         self.calc = calc
@@ -206,6 +213,9 @@ class ConformerEnsemble:
         self.parallel_batch_folder_location = parallel_batch_folder_location
         self.process_timeout = process_timeout
         self.step_callback = step_callback
+        self.fixed_bonds = (
+            {frozenset(bond) for bond in fixed_bonds} if fixed_bonds else set()
+        )
         if self.num_cpus == 0:
             self.num_cpus = os.cpu_count()
         if self.verbose:
@@ -267,7 +277,8 @@ class ConformerEnsemble:
         )
         self.max_bonds_rotate = min(len(dihedrals), self.max_bonds_rotate)
 
-        # Remove any dihedrals associated with constrained atoms
+        # Remove any dihedrals associated with constrained atoms or whose central
+        # bond was explicitly fixed via fixed_bonds.
         final_dihedrals = []
         for dihedral in dihedrals:
             if self.conformer.constrained_atoms is not None and (
@@ -276,9 +287,22 @@ class ConformerEnsemble:
             ):
                 # If the bond is constrained, we need to remove it from the list of rotatable bonds
                 continue
+            elif frozenset((dihedral[1], dihedral[2])) in self.fixed_bonds:
+                # Central bond explicitly fixed by the user: skip the rotation
+                continue
             else:
                 final_dihedrals.append(dihedral)
         dihedrals = final_dihedrals
+
+        # Report the rotatable bonds (central b-c atom of each torsion), using
+        # 1-based atom indices and element symbols (e.g. "C1-C12").
+        mol = self.conformer.mol
+        bond_labels = [
+            f"{mol.GetAtomWithIdx(b).GetSymbol()}{b + 1}-"
+            f"{mol.GetAtomWithIdx(c).GetSymbol()}{c + 1}"
+            for _, b, c, _ in dihedrals
+        ]
+        self.log_info(f"Rotating {len(dihedrals)} bond(s): {', '.join(bond_labels)}")
 
         # Initialize information for identity checking
         # TODO: halides are weird with bond formation occasionally so they are currently gnore

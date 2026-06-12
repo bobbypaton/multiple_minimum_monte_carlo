@@ -16,6 +16,7 @@ or equivalently:
 import argparse
 import math
 import os
+import re
 import shutil
 import sys
 from copy import copy
@@ -227,6 +228,17 @@ def parse_args():
         help="Dihedral rotation step size in degrees (default: 60.0)",
     )
     parser.add_argument(
+        "--fix",
+        action="extend",
+        nargs="+",
+        default=[],
+        metavar="BOND",
+        help="Rotatable bond(s) to hold fixed (not rotated), named by their "
+        "1-indexed central atoms as printed in 'Rotatable bonds', e.g. "
+        "--fix C5-O4 (or just 5-4). Repeatable and space-separated. The atoms "
+        "still relax during optimization; only the random rotation is skipped",
+    )
+    parser.add_argument(
         "--model",
         choices=sorted(MODELS),
         default="aimnet2",
@@ -313,10 +325,42 @@ def main():
 
     dihedrals = cheminformatics.get_dihedral_matches(conformer.mol, False)
 
+    def bond_label(b, c):
+        return (
+            f"{conformer.mol.GetAtomWithIdx(b).GetSymbol()}{b + 1}-"
+            f"{conformer.mol.GetAtomWithIdx(c).GetSymbol()}{c + 1}"
+        )
+
+    # Resolve any --fix bonds (named by 1-indexed central atoms) to their 0-based
+    # central-bond pairs, validating against the actual rotatable bonds.
+    available = {frozenset((b + 1, c + 1)): (b, c) for _, b, c, _ in dihedrals}
+    all_labels = [bond_label(b, c) for _, b, c, _ in dihedrals]
+    fixed_bonds = []
+    for token in args.fix:
+        nums = re.findall(r"\d+", token)
+        if len(nums) != 2:
+            sys.exit(f"--fix value '{token}' must name two atoms, e.g. C5-O4 or 5-4")
+        key = frozenset((int(nums[0]), int(nums[1])))
+        if key not in available:
+            sys.exit(
+                f"--fix bond '{token}' is not a rotatable bond. "
+                f"Available: {', '.join(all_labels) or 'none'}"
+            )
+        fixed_bonds.append(available[key])
+
+    fixed_set = {frozenset(bc) for bc in fixed_bonds}
+    dihedrals = [d for d in dihedrals if frozenset((d[1], d[2])) not in fixed_set]
+    bond_labels = [bond_label(b, c) for _, b, c, _ in dihedrals]
+
     console.print(
         f"[bold]Molecular formula:[/] [cyan]{conformer.atoms.get_chemical_formula()}[/]"
     )
     console.print(f"[bold]Rotatable torsions:[/] {len(dihedrals)}")
+    if bond_labels:
+        console.print(f"[bold]Rotatable bonds:[/] [green]{', '.join(bond_labels)}[/]")
+    if fixed_bonds:
+        fixed_str = ", ".join(bond_label(b, c) for b, c in fixed_bonds)
+        console.print(f"[bold]Fixed bonds (not rotated):[/] [red]{fixed_str}[/]")
     console.print(f"[bold]Estimated conformer space (3^N):[/] {3 ** len(dihedrals)}")
 
     if args.model == "xtb-cli":
@@ -441,6 +485,7 @@ def main():
         num_cpus=args.num_cpus,
         verbose=args.verbose,
         step_callback=report_step,
+        fixed_bonds=fixed_bonds,
     )
     ensemble.run_monte_carlo()
     if args.quiet and not stopped_early:
