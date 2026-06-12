@@ -56,6 +56,19 @@ calc = TorchSimCalculation(model=model, optimizer=Optimizer.fire, max_cycles=500
 conformer_ensemble = ConformerEnsemble(conformer=conformer, calc=calc)
 ```
 
+### Using the xtb command-line program
+
+If you have the standalone [xtb](https://github.com/grimme-lab/xtb) executable installed (e.g. `conda install -c conda-forge xtb`), XTBCalculation will run optimizations by shelling out to it directly — no Python bindings (tblite) required. This uses xtb's native optimizer, is often faster than driving GFN2-xTB through an ASE optimizer, and works well on macOS.
+
+```python
+from multiple_minimum_monte_carlo.calculation import XTBCalculation
+
+calc = XTBCalculation(charge=0, spin_multiplicity=1)
+conformer_ensemble = ConformerEnsemble(conformer=conformer, calc=calc)
+```
+
+Optional arguments include `method` ("gfn0", "gfn1", "gfn2", or "gfnff"), `opt_level` (xtb convergence level, e.g. "tight"), and `solvent` (ALPB implicit solvent, e.g. "water"). From the command line, the same backend is available as `mcmm input.xyz --model xtb-cli`.
+
 ### A note about parallel calculations
 
 As opposed to batched calculations, you can also do calculations in parallel with a Calculation object by setting parallel=True in the ConformerEnsemble object. However, this requires that the multiprocessing start method "fork" is used which may be incompatible with certain workflows.

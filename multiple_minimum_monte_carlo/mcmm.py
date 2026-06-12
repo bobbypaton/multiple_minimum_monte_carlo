@@ -15,6 +15,7 @@ or equivalently:
 
 import argparse
 import os
+import shutil
 import sys
 from copy import copy
 
@@ -22,7 +23,7 @@ from ase.optimize import BFGS, FIRE, LBFGS
 from rdkit.Chem import rdMolTransforms
 
 from multiple_minimum_monte_carlo import cheminformatics
-from multiple_minimum_monte_carlo.calculation import ASEOptimization
+from multiple_minimum_monte_carlo.calculation import ASEOptimization, XTBCalculation
 from multiple_minimum_monte_carlo.conformer import Conformer
 from multiple_minimum_monte_carlo.conformer_ensemble import ConformerEnsemble
 
@@ -33,6 +34,7 @@ MODELS = {
     "mace-off": "MACE-OFF",
     "ani2x": "ANI-2x",
     "xtb": "GFN2-xTB",
+    "xtb-cli": "GFN2-xTB (xtb binary)",
     "uma": "UMA (FairChem)",
 }
 
@@ -185,19 +187,28 @@ def parse_args():
         default="aimnet2",
         help="Energy model to use (default: aimnet2). Each backend needs its own "
         "package: aimnet2 (aimnet), mace-off (mace-torch), ani2x (torchani), "
-        "xtb (tblite), uma (fairchem-core)",
+        "xtb (tblite), xtb-cli (the xtb executable on PATH), uma (fairchem-core)",
     )
     parser.add_argument(
         "--optimizer",
         choices=sorted(OPTIMIZERS),
         default="lbfgs",
-        help="ASE optimizer to use (default: lbfgs)",
+        help="ASE optimizer to use (default: lbfgs); "
+        "ignored by xtb-cli, which uses xtb's native optimizer",
     )
     parser.add_argument(
         "--fmax",
         type=float,
         default=0.05,
-        help="Force convergence criterion in eV/Angstrom (default: 0.05)",
+        help="Force convergence criterion in eV/Angstrom (default: 0.05); "
+        "ignored by xtb-cli, see --opt-level",
+    )
+    parser.add_argument(
+        "--opt-level",
+        choices=("crude", "sloppy", "loose", "normal", "tight", "vtight", "extreme"),
+        default="normal",
+        help="Optimization convergence level for the xtb-cli model "
+        "(default: normal); other models use --fmax",
     )
     parser.add_argument(
         "--no-initial-optimization",
@@ -252,22 +263,34 @@ def main():
     dihedrals = cheminformatics.get_dihedral_matches(conformer.mol, False)
     print(f"Molecular formula: {conformer.atoms.get_chemical_formula()}")
     print(f"Rotatable torsions: {len(dihedrals)}")
-    print(f"Estimated conformer space (3^N): {3**len(dihedrals)}")
+    print(f"Estimated conformer space (3^N): {3 ** len(dihedrals)}")
 
-    model_calc, device = build_calculator(
-        args.model, args.charge, args.spin_multiplicity
-    )
+    if args.model == "xtb-cli":
+        if shutil.which("xtb") is None:
+            sys.exit(
+                "xtb executable not found on PATH.\nInstall it with: "
+                "conda install -c conda-forge xtb"
+            )
+        device = "cpu"
+        calc = XTBCalculation(
+            charge=args.charge,
+            spin_multiplicity=args.spin_multiplicity,
+            opt_level=args.opt_level,
+        )
+    else:
+        model_calc, device = build_calculator(
+            args.model, args.charge, args.spin_multiplicity
+        )
+        calc = ASEOptimization(
+            calc=model_calc,
+            optimizer=OPTIMIZERS[args.optimizer],
+            fmax=args.fmax,
+        )
     print(f"Model: {MODELS[args.model]}")
     if device.startswith("cuda"):
         print(f"GPU acceleration: yes ({device})")
     else:
         print(f"GPU acceleration: no (running on {device})")
-
-    calc = ASEOptimization(
-        calc=model_calc,
-        optimizer=OPTIMIZERS[args.optimizer],
-        fmax=args.fmax,
-    )
 
     if not args.no_initial_optimization:
         print("Running initial optimization...")
@@ -329,10 +352,7 @@ def main():
             stopped_early = True
             if args.quiet:
                 print()
-            print(
-                "No conformers accepted in the last 10 steps - "
-                "stopping search early"
-            )
+            print("No conformers accepted in the last 10 steps - stopping search early")
             return True
         return False
 
