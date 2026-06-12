@@ -56,6 +56,10 @@ class ConformerEnsemble:
         calc (Union[Calculation, BatchCalculation]): Calculator for optimizations.
         final_ensemble (List[np.ndarray]): Final set of unique conformer coordinates.
         final_energies (List[float]): Energies corresponding to final_ensemble.
+        found (List[int]): Degeneracy of each final conformer, i.e. how many times
+            it was located during the search (1 = found once).
+        origin (List[str]): Where each final conformer came from: "input" for the
+            starting structure, "mc" for ones discovered by Monte Carlo sampling.
     """
 
     def __init__(
@@ -68,6 +72,12 @@ class ConformerEnsemble:
         max_attempts: Optional[int] = 1000,
         angle_step: Optional[float] = 30.0,
         rmsd_threshold: Optional[float] = 0.3,
+        uniqueness_method: Optional[str] = "rmsd",
+        ethr: Optional[float] = 0.05,
+        rthr: Optional[float] = 0.125,
+        bthr: Optional[float] = 0.01,
+        bthrmax: Optional[float] = 0.025,
+        bthrshift: Optional[float] = 0.5,
         initial_optimization: Optional[bool] = True,
         random_walk: Optional[bool] = False,
         reduce_angle: Optional[bool] = False,
@@ -101,7 +111,29 @@ class ConformerEnsemble:
                 are randomly selected from multiples of this value. Default is 30.0.
             rmsd_threshold: RMSD threshold (in Angstroms) for distinguishing unique
                 conformers. Conformers with RMSD below this to any existing conformer
-                are discarded as duplicates. Default is 0.3.
+                are discarded as duplicates. Default is 0.3. Only used when
+                uniqueness_method is "rmsd".
+            uniqueness_method: How to decide whether a new conformer is a duplicate
+                of an existing one. "rmsd" (default) discards a conformer whose RMSD
+                to any existing member is below rmsd_threshold. "crest" follows the
+                CREST/CREGEN criterion: a conformer is a duplicate only if its
+                energy, rotational constants, and RMSD all match an existing member
+                within ethr, an anisotropy-adjusted bthr, and rthr respectively. The
+                rotational-constant test makes "crest" robust to symmetry-equivalent
+                atom permutations that an RMSD-only test can miss.
+            ethr: Pairwise energy threshold (in kcal/mol) for the "crest" method.
+                Two conformers closer than this in energy may be treated as
+                duplicates. Default is 0.05.
+            rthr: RMSD threshold (in Angstroms) for the "crest" method. Default is
+                0.125.
+            bthr: Lower-bound relative threshold for the rotational-constant
+                comparison in the "crest" method. Dynamically widened up to bthrmax
+                based on the anisotropy of each pair's rotational constants. Default
+                is 0.01 (1%).
+            bthrmax: Upper bound for the anisotropy-adjusted rotational-constant
+                threshold in the "crest" method. Default is 0.025 (2.5%).
+            bthrshift: Shift of the error-function ramp that maps anisotropy onto the
+                rotational-constant threshold in the "crest" method. Default is 0.5.
             initial_optimization: If True, perform a structure optimization on the
                 starting conformer before Monte Carlo sampling. Default is True.
             random_walk: If True, randomly select conformers from the ensemble for
@@ -150,6 +182,16 @@ class ConformerEnsemble:
         self.max_attempts = max_attempts
         self.angle_step = angle_step
         self.rmsd_threshold = rmsd_threshold
+        if uniqueness_method not in ("rmsd", "crest"):
+            raise ValueError(
+                f"uniqueness_method must be 'rmsd' or 'crest', got {uniqueness_method!r}"
+            )
+        self.uniqueness_method = uniqueness_method
+        self.ethr = ethr
+        self.rthr = rthr
+        self.bthr = bthr
+        self.bthrmax = bthrmax
+        self.bthrshift = bthrshift
         self.initial_optimization = initial_optimization
         self.random_walk = random_walk
         self.reduce_angle = reduce_angle
@@ -170,6 +212,9 @@ class ConformerEnsemble:
             logging.basicConfig(stream=sys.stdout, level=logging.INFO)
         self.final_ensemble = []
         self.final_energies = []
+        self.found = []
+        self.origin = []
+        self._duplicate_index = None
         if self.parallel and self.batch:
             self.parallel = False
             self.log_warning(
@@ -246,6 +291,11 @@ class ConformerEnsemble:
         final_ensemble = [self.conformer.atoms.get_positions()]
         final_energies = [energy]
         used = [0]
+        # found[i] = how many times conformer i was located (1 = the initial
+        # discovery); incremented each time a trial is rejected as a duplicate of
+        # it. origin[i] records where it came from: "input" or "mc".
+        found = [1]
+        origin = ["input"]
         current_iter = 0
         samples_per_batch = 1
         if self.batch:
@@ -290,8 +340,14 @@ class ConformerEnsemble:
                     final_ensemble.append(positions)
                     final_energies.append(energy)
                     used.append(0)
+                    found.append(1)
+                    origin.append("mc")
                     accepted.append(True)
                 else:
+                    # If it was rejected as a duplicate of an existing member,
+                    # bump that member's degeneracy count.
+                    if self._duplicate_index is not None:
+                        found[self._duplicate_index] += 1
                     accepted.append(False)
             stop_requested = False
             if self.step_callback is not None:
@@ -305,12 +361,17 @@ class ConformerEnsemble:
                 )
 
             # Sort all of the lists by energies
-            final_ensemble, used, final_energies = zip(
-                *sorted(zip(final_ensemble, used, final_energies), key=lambda x: x[2])
+            final_ensemble, used, final_energies, found, origin = zip(
+                *sorted(
+                    zip(final_ensemble, used, final_energies, found, origin),
+                    key=lambda x: x[2],
+                )
             )
             final_ensemble = list(final_ensemble)
             used = list(used)
             final_energies = list(final_energies)
+            found = list(found)
+            origin = list(origin)
 
             if stop_requested:
                 self.log_info("Search stopped early by step_callback")
@@ -318,6 +379,8 @@ class ConformerEnsemble:
 
         self.final_ensemble = final_ensemble
         self.final_energies = final_energies
+        self.found = found
+        self.origin = origin
 
     def run_optimizations(
         self, atoms_list: List[ase.Atoms]
@@ -478,7 +541,12 @@ class ConformerEnsemble:
         This function evaluates if the provided conformer (`conf`) with its associated energy (`energy`) is sufficiently low in energy
         and structurally distinct from all conformers already present in the ensemble. The conformer is accepted if:
           - Its energy is within `self.energy_window` of the minimum energy in the current ensemble.
-          - Its root-mean-square deviation (RMSD) from all conformers in the ensemble is greater than `self.rmsd_threshold`.
+          - It preserves the input bond connectivity (identity check).
+          - It is distinct from every existing member under the selected uniqueness method:
+              * "rmsd": its RMSD to all members exceeds `self.rmsd_threshold`.
+              * "crest": no member matches it on all of energy (`self.ethr`),
+                rotational constants (anisotropy-adjusted `self.bthr`), and RMSD
+                (`self.rthr`) simultaneously.
         Args:
             ensemble (list): List of conformers cooordinates currently in the ensemble, each represented as np.ndarray objects.
             energies (list): List of energies corresponding to the conformers in the ensemble.
@@ -488,7 +556,18 @@ class ConformerEnsemble:
             bool: True if the conformer passes both the energy and RMSD criteria and should be added to the ensemble, False otherwise.
         """
 
+        # Index of the existing member this candidate duplicates, if any. Reset
+        # each call; set only when a duplicate match is found below.
+        self._duplicate_index = None
+        self.log_info(
+            f"Checking candidate (E={energy:.4f} kcal/mol) against "
+            f"{len(ensemble)} ensemble member(s) using '{self.uniqueness_method}' criterion"
+        )
         if energy > min(energies) + self.energy_window:
+            self.log_info(
+                f"  rejected: energy exceeds window "
+                f"(min {min(energies):.4f} + {self.energy_window} kcal/mol)"
+            )
             return False
         temp_atoms = copy(self.conformer.atoms)
         temp_atoms.set_positions(conf)
@@ -502,16 +581,80 @@ class ConformerEnsemble:
             )
             return False
         if not identity:
+            self.log_info("  rejected: connectivity changed (identity check failed)")
             return False
         temp_mol = copy(self.conformer.mol)
         temp_mol = cheminformatics.add_coords_to_mol(conf, temp_mol)
         temp_reference_mol = copy(self.conformer.mol)
         atom_map = [(i, i) for i in range(len(temp_mol.GetAtoms()))]
-        for reference_conf in ensemble:
+        if self.uniqueness_method == "crest":
+            masses = self.conformer.atoms.get_masses()
+            candidate_rot = cheminformatics.rotational_constants(conf, masses)
+            for idx, (reference_conf, reference_energy) in enumerate(
+                zip(ensemble, energies)
+            ):
+                # Cheapest checks first: energy, then rotational constants, then
+                # the comparatively expensive RMSD alignment. A member is a
+                # duplicate only if all three match.
+                delta_e = abs(energy - reference_energy)
+                if delta_e >= self.ethr:
+                    self.log_info(
+                        f"  vs #{idx}: dE={delta_e:.4f} >= ethr {self.ethr} -> distinct"
+                    )
+                    continue
+                reference_rot = cheminformatics.rotational_constants(
+                    reference_conf, masses
+                )
+                if not cheminformatics.rotational_constants_equal(
+                    candidate_rot,
+                    reference_rot,
+                    self.bthr,
+                    self.bthrmax,
+                    self.bthrshift,
+                ):
+                    if self.verbose:
+                        rot_max = float(
+                            np.max(np.abs(candidate_rot / reference_rot - 1.0))
+                        )
+                        self.log_info(
+                            f"  vs #{idx}: dE={delta_e:.4f} < ethr, "
+                            f"rot |dB|max={rot_max:.4f} mismatch -> distinct"
+                        )
+                    continue
+                temp_reference_mol = cheminformatics.add_coords_to_mol(
+                    reference_conf, temp_reference_mol
+                )
+                rmsd = rdMolAlign.AlignMol(
+                    temp_mol, temp_reference_mol, atomMap=atom_map
+                )
+                if rmsd < self.rthr:
+                    self.log_info(
+                        f"  vs #{idx}: dE={delta_e:.4f} < ethr, rot match, "
+                        f"rmsd={rmsd:.4f} < rthr {self.rthr} -> DUPLICATE"
+                    )
+                    self._duplicate_index = idx
+                    return False
+                self.log_info(
+                    f"  vs #{idx}: dE={delta_e:.4f} < ethr, rot match, "
+                    f"rmsd={rmsd:.4f} >= rthr {self.rthr} -> distinct"
+                )
+            self.log_info("  accepted: distinct from all members")
+            return True
+        for idx, reference_conf in enumerate(ensemble):
             temp_reference_mol = cheminformatics.add_coords_to_mol(
                 reference_conf, temp_reference_mol
             )
             rmsd = rdMolAlign.AlignMol(temp_mol, temp_reference_mol, atomMap=atom_map)
             if rmsd < self.rmsd_threshold:
+                self.log_info(
+                    f"  vs #{idx}: rmsd={rmsd:.4f} < threshold "
+                    f"{self.rmsd_threshold} -> DUPLICATE"
+                )
+                self._duplicate_index = idx
                 return False
+            self.log_info(
+                f"  vs #{idx}: rmsd={rmsd:.4f} >= threshold "
+                f"{self.rmsd_threshold} -> distinct"
+            )
+        self.log_info("  accepted: distinct from all members")
         return True

@@ -2306,6 +2306,7 @@ dependencies = [
     { name = "ase", version = "3.23.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },
     { name = "ase", version = "3.26.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.9'" },
     { name = "rdkit" },
+    { name = "rich" },
     { name = "scipy", version = "1.10.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },
     { name = "scipy", version = "1.13.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.9.*'" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
@@ -2333,6 +2334,7 @@ dev = [
 requires-dist = [
     { name = "ase" },
     { name = "rdkit" },
+    { name = "rich" },
     { name = "scipy" },
     { name = "torch", specifier = ">=2.5.1" },
 ]

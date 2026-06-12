@@ -69,6 +69,36 @@ conformer_ensemble = ConformerEnsemble(conformer=conformer, calc=calc)
 
 Optional arguments include `method` ("gfn0", "gfn1", "gfn2", or "gfnff"), `opt_level` (xtb convergence level, e.g. "tight"), and `solvent` (ALPB implicit solvent, e.g. "water"). From the command line, the same backend is available as `mcmm input.xyz --model xtb-cli`.
 
+### Command-line interface
+
+The package installs an `mcmm` command for running a search directly on an XYZ file:
+
+```bash
+mcmm input.xyz --steps 100 --model aimnet2
+```
+
+This optimizes the input structure, runs the Monte Carlo search, writes the final ensemble to `input_mcmm.xyz` (ordered lowest energy first, with each frame's energy on its comment line), and prints a formatted summary of the unique conformers:
+
+```text
+────────────────────── Final Ensemble Information ──────────────────────
+output file name               : input_mcmm.xyz
+conformer energy window  /kcal :  10.0000
+total number unique conformers :        3
+lowest energy conformer    /Eh : -649.151439
+
+ #   Erel/kcal      Etot/Eh   weight/tot   found   origin
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 1       0.000   -649.15144      0.47811       1   input
+ 2       0.088   -649.15130      0.41204       1     mc
+ 3       0.871   -649.15005      0.10985       2     mc
+```
+
+`Erel`/`Etot` are the relative and total energies, `weight/tot` is the Boltzmann population at 298 K, `found` is how many times each unique conformer was located during the search, and `origin` marks the starting structure (`input`) versus Monte-Carlo-discovered conformers (`mc`). Run `mcmm --help` for the full list of options (energy window, RMSD threshold, model and optimizer choice, parallel/batched execution, and more).
+
+### Conformer deduplication
+
+By default a new conformer is considered unique when its RMSD to every existing member exceeds `rmsd_threshold`. Passing `uniqueness_method="crest"` to `ConformerEnsemble` (or `--uniqueness-method crest` on the command line) switches to a CREST/CREGEN-style criterion: a conformer is treated as a duplicate only when it matches an existing member in energy, rotational constants, and RMSD simultaneously, which is more robust to symmetry-equivalent atom permutations than RMSD alone.
+
 ### A note about parallel calculations
 
 As opposed to batched calculations, you can also do calculations in parallel with a Calculation object by setting parallel=True in the ConformerEnsemble object. However, this requires that the multiprocessing start method "fork" is used which may be incompatible with certain workflows.

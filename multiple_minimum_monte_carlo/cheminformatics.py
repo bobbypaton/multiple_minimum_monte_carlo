@@ -333,3 +333,126 @@ def check_identity_mc(
                             continue
                         mc_bonds.append((i, atom))
     return set(original_bonds) == set(mc_bonds)
+
+
+def rotational_constants(positions: np.ndarray, masses: np.ndarray) -> np.ndarray:
+    """Compute the three rotational constants of a structure.
+
+    The constants are proportional to the inverse of the principal moments of
+    inertia (B ~ 1/I) and returned sorted in descending order, so that the k-th
+    constant of two structures always refers to the same principal axis -- a
+    requirement for the element-wise comparison in `rotational_constants_equal`.
+    Units are arbitrary but consistent (1 / amu*Angstrom^2); only relative
+    differences are used downstream, so the absolute scale cancels.
+
+    Args:
+        positions: Array of shape (n_atoms, 3) of Cartesian coordinates.
+        masses: Array of shape (n_atoms,) of atomic masses.
+
+    Returns:
+        Array of three rotational constants, largest first.
+    """
+    masses = np.asarray(masses, dtype=float)
+    positions = np.asarray(positions, dtype=float)
+    com = (masses[:, None] * positions).sum(axis=0) / masses.sum()
+    rel = positions - com
+    x, y, z = rel[:, 0], rel[:, 1], rel[:, 2]
+    inertia = np.array(
+        [
+            [
+                np.sum(masses * (y**2 + z**2)),
+                -np.sum(masses * x * y),
+                -np.sum(masses * x * z),
+            ],
+            [
+                -np.sum(masses * x * y),
+                np.sum(masses * (x**2 + z**2)),
+                -np.sum(masses * y * z),
+            ],
+            [
+                -np.sum(masses * x * z),
+                -np.sum(masses * y * z),
+                np.sum(masses * (x**2 + y**2)),
+            ],
+        ]
+    )
+    # eigvalsh returns ascending eigenvalues; clip guards linear/degenerate
+    # structures (a near-zero principal moment) from producing infinities.
+    moments = np.clip(np.linalg.eigvalsh(inertia), 1e-8, None)
+    return 1.0 / moments
+
+
+def rotational_anisotropy(rot: np.ndarray) -> float:
+    """Normalized anisotropy of a structure's three rotational constants.
+
+    Replicates CREST's `rotaniso` (rotcompare.f90): the spread of the three
+    constants about their mean, scaled to roughly [0, 1] (0 for a spherical top
+    where A = B = C, approaching 1 for a highly asymmetric top).
+
+    Args:
+        rot: Array of three rotational constants.
+
+    Returns:
+        The anisotropy measure.
+    """
+    av = rot.mean()
+    if av == 0:
+        return 0.0
+    aniso = math.sqrt(np.sum((rot - av) ** 2)) / av
+    return aniso / (3.0 * math.sqrt(2.0 / 3.0))
+
+
+def bthr_anisotropy_threshold(
+    bthr: float, aniso: float, bthrmax: float, bthrshift: float
+) -> float:
+    """Scale the rotational-constant threshold by structural anisotropy.
+
+    Replicates CREST's `bthrerf` (rotcompare.f90): an error-function ramp that
+    maps anisotropy in [0, 1] onto a threshold in [bthr, bthrmax], so that more
+    asymmetric tops (whose rotational constants are more discriminating) are
+    compared with a looser relative tolerance.
+
+    Args:
+        bthr: Lower-bound relative threshold (anisotropy -> 0).
+        aniso: Anisotropy measure from `rotational_anisotropy`.
+        bthrmax: Upper-bound relative threshold (anisotropy -> 1).
+        bthrshift: Shift of the error-function ramp.
+
+    Returns:
+        The anisotropy-adjusted relative threshold.
+    """
+    c = ((bthrmax * 100.0) - (bthr * 100.0)) / 2.0
+    a = -math.erf(-2.5) * c + (bthr * 100.0)
+    b = 4.0 / 0.8
+    d = bthrshift / 0.15
+    return (math.erf(aniso * b - d) * c + a) / 100.0
+
+
+def rotational_constants_equal(
+    rot_i: np.ndarray,
+    rot_j: np.ndarray,
+    bthr: float = 0.01,
+    bthrmax: float = 0.025,
+    bthrshift: float = 0.5,
+) -> bool:
+    """Test whether two structures have matching rotational constants.
+
+    Replicates CREST's `equalrotaniso` (rotcompare.f90): each of the three
+    constants must agree within an anisotropy-adjusted relative threshold (the
+    anisotropy averaged over the two structures). Because rotational constants
+    are invariant to translation, rotation, and atom permutation, this is a
+    symmetry-robust complement to an RMSD comparison.
+
+    Args:
+        rot_i: Rotational constants of the first structure.
+        rot_j: Rotational constants of the second structure.
+        bthr: Lower-bound relative threshold.
+        bthrmax: Upper-bound relative threshold for high anisotropy.
+        bthrshift: Shift of the anisotropy error-function ramp.
+
+    Returns:
+        True if the two structures are indistinguishable by rotational constants.
+    """
+    aniso = (rotational_anisotropy(rot_i) + rotational_anisotropy(rot_j)) / 2.0
+    thr = bthr_anisotropy_threshold(bthr, aniso, bthrmax, bthrshift)
+    return bool(np.all(np.abs(rot_i / rot_j - 1.0) <= thr))

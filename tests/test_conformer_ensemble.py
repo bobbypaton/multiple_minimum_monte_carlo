@@ -65,3 +65,77 @@ def test_constraint_test_detects_close_atoms(monkeypatch):
         conf.SetAtomPosition(i, (0.0, 0.0, 0.0))
     ensemble = ConformerEnsemble(c, calc=None, num_iterations=1, parallel=False)
     assert ensemble.constraint_test(conf) is False
+
+
+def _make_real_conformer():
+    """Build a Conformer with real 3D coordinates and an ASE Atoms object,
+    bypassing the heavy SMILES initializer."""
+    from rdkit.Chem import AllChem
+    from ase import Atoms as ASEAtoms
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("CC"))
+    AllChem.EmbedMolecule(mol, randomSeed=1)
+    positions = mol.GetConformer().GetPositions()
+    symbols = [a.GetSymbol() for a in mol.GetAtoms()]
+    c = Conformer.__new__(Conformer)
+    c.mol = mol
+    c.atoms = ASEAtoms(symbols=symbols, positions=positions)
+    c.constrained_atoms = []
+    c.bonded_atoms = []
+    c.charge = 0
+    return c, positions
+
+
+def _crest_ensemble(monkeypatch, method):
+    from multiple_minimum_monte_carlo import cheminformatics
+
+    c, positions = _make_real_conformer()
+    ensemble = ConformerEnsemble(
+        c,
+        calc=None,
+        uniqueness_method=method,
+        energy_window=1000.0,
+        rmsd_threshold=0.3,
+    )
+    # identity check is orthogonal to dedup; bypass it here
+    ensemble.original_bonds = []
+    ensemble.metal_atoms = []
+    ensemble.halides = []
+    monkeypatch.setattr(cheminformatics, "check_identity_mc", lambda *a, **k: True)
+    return ensemble, positions
+
+
+def test_invalid_uniqueness_method_raises():
+    c = make_dummy_conformer(None)
+    with pytest.raises(ValueError):
+        ConformerEnsemble(c, calc=None, uniqueness_method="bogus")
+
+
+def test_crest_energy_distinguishes_identical_geometry(monkeypatch):
+    ensemble, positions = _crest_ensemble(monkeypatch, "crest")
+    existing, energies = [positions], [0.0]
+    # identical geometry + same energy -> duplicate -> rejected
+    assert ensemble.check_conformer(existing, energies, positions, 0.0) is False
+    # identical geometry but energy differs by more than ethr (0.05) -> kept distinct
+    assert ensemble.check_conformer(existing, energies, positions, 1.0) is True
+
+
+def test_rmsd_method_ignores_energy(monkeypatch):
+    ensemble, positions = _crest_ensemble(monkeypatch, "rmsd")
+    existing, energies = [positions], [0.0]
+    # under rmsd-only, identical geometry is a duplicate regardless of energy
+    assert ensemble.check_conformer(existing, energies, positions, 1.0) is False
+
+
+def test_crest_verbose_logs_comparisons(monkeypatch, caplog):
+    import logging
+
+    ensemble, positions = _crest_ensemble(monkeypatch, "crest")
+    ensemble.verbose = True
+    with caplog.at_level(logging.INFO):
+        # identical geometry + same energy -> logged DUPLICATE
+        ensemble.check_conformer([positions], [0.0], positions, 0.0)
+    text = caplog.text
+    assert "Checking candidate" in text
+    assert "vs #0" in text
+    assert "DUPLICATE" in text
