@@ -7,6 +7,7 @@ requires-python = ">=3.8"
 dependencies = [
     "ase",
     "rdkit",
+    "rich",
     "scipy",
     "torch>=2.5.1",
 ]

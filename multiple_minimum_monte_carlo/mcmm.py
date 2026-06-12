@@ -14,17 +14,26 @@ or equivalently:
 """
 
 import argparse
+import math
 import os
+import re
+import shutil
 import sys
 from copy import copy
 
 from ase.optimize import BFGS, FIRE, LBFGS
 from rdkit.Chem import rdMolTransforms
+from rich import box
+from rich.console import Console
+from rich.markup import escape
+from rich.table import Table
 
 from multiple_minimum_monte_carlo import cheminformatics
-from multiple_minimum_monte_carlo.calculation import ASEOptimization
+from multiple_minimum_monte_carlo.calculation import ASEOptimization, XTBCalculation
 from multiple_minimum_monte_carlo.conformer import Conformer
 from multiple_minimum_monte_carlo.conformer_ensemble import ConformerEnsemble
+
+console = Console(highlight=False)
 
 OPTIMIZERS = {"fire": FIRE, "bfgs": BFGS, "lbfgs": LBFGS}
 
@@ -33,6 +42,7 @@ MODELS = {
     "mace-off": "MACE-OFF",
     "ani2x": "ANI-2x",
     "xtb": "GFN2-xTB",
+    "xtb-cli": "GFN2-xTB (xtb binary)",
     "uma": "UMA (FairChem)",
 }
 
@@ -165,7 +175,45 @@ def parse_args():
         "--rmsd-threshold",
         type=float,
         default=0.3,
-        help="RMSD threshold in Angstroms for duplicate filtering (default: 0.3)",
+        help="RMSD threshold in Angstroms for duplicate filtering, 'rmsd' method only (default: 0.3)",
+    )
+    parser.add_argument(
+        "--uniqueness-method",
+        choices=("rmsd", "crest"),
+        default="rmsd",
+        help="Duplicate-detection method: 'rmsd' (RMSD only) or 'crest' (energy + rotational constants + RMSD, CREST/CREGEN-style) (default: rmsd)",
+    )
+    parser.add_argument(
+        "--ethr",
+        type=float,
+        default=0.05,
+        help="Pairwise energy threshold in kcal/mol for the 'crest' method (default: 0.05)",
+    )
+    parser.add_argument(
+        "--rthr",
+        type=float,
+        default=0.125,
+        help="RMSD threshold in Angstroms for the 'crest' method (default: 0.125)",
+    )
+    parser.add_argument(
+        "--bthr",
+        type=float,
+        default=0.01,
+        help="Lower-bound relative rotational-constant threshold for the 'crest' method (default: 0.01)",
+    )
+    parser.add_argument(
+        "--bthrmax",
+        type=float,
+        default=0.025,
+        help="Upper-bound relative rotational-constant threshold for the 'crest' method; "
+        "the threshold is widened toward this value for anisotropic tops (default: 0.025)",
+    )
+    parser.add_argument(
+        "--bthrshift",
+        type=float,
+        default=0.5,
+        help="Anisotropy shift controlling how quickly the rotational-constant threshold "
+        "widens from bthr toward bthrmax for the 'crest' method (default: 0.5)",
     )
     parser.add_argument(
         "--max-bonds-rotate",
@@ -180,24 +228,44 @@ def parse_args():
         help="Dihedral rotation step size in degrees (default: 60.0)",
     )
     parser.add_argument(
+        "--fix",
+        action="extend",
+        nargs="+",
+        default=[],
+        metavar="BOND",
+        help="Rotatable bond(s) to hold fixed (not rotated), named by their "
+        "1-indexed central atoms as printed in 'Rotatable bonds', e.g. "
+        "--fix C5-O4 (or just 5-4). Repeatable and space-separated. The atoms "
+        "still relax during optimization; only the random rotation is skipped",
+    )
+    parser.add_argument(
         "--model",
         choices=sorted(MODELS),
         default="aimnet2",
         help="Energy model to use (default: aimnet2). Each backend needs its own "
         "package: aimnet2 (aimnet), mace-off (mace-torch), ani2x (torchani), "
-        "xtb (tblite), uma (fairchem-core)",
+        "xtb (tblite), xtb-cli (the xtb executable on PATH), uma (fairchem-core)",
     )
     parser.add_argument(
         "--optimizer",
         choices=sorted(OPTIMIZERS),
         default="lbfgs",
-        help="ASE optimizer to use (default: lbfgs)",
+        help="ASE optimizer to use (default: lbfgs); "
+        "ignored by xtb-cli, which uses xtb's native optimizer",
     )
     parser.add_argument(
         "--fmax",
         type=float,
         default=0.05,
-        help="Force convergence criterion in eV/Angstrom (default: 0.05)",
+        help="Force convergence criterion in eV/Angstrom (default: 0.05); "
+        "ignored by xtb-cli, see --opt-level",
+    )
+    parser.add_argument(
+        "--opt-level",
+        choices=("crude", "sloppy", "loose", "normal", "tight", "vtight", "extreme"),
+        default="normal",
+        help="Optimization convergence level for the xtb-cli model "
+        "(default: normal); other models use --fmax",
     )
     parser.add_argument(
         "--no-initial-optimization",
@@ -219,6 +287,12 @@ def parse_args():
         "--quiet",
         action="store_true",
         help="Show a progress bar instead of per-step dihedral and energy output",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print the per-step uniqueness comparisons against previous conformers",
     )
     return parser.parse_args()
 
@@ -250,37 +324,86 @@ def main():
     )
 
     dihedrals = cheminformatics.get_dihedral_matches(conformer.mol, False)
-    print(f"Molecular formula: {conformer.atoms.get_chemical_formula()}")
-    print(f"Rotatable torsions: {len(dihedrals)}")
-    print(f"Estimated conformer space (3^N): {3**len(dihedrals)}")
 
-    model_calc, device = build_calculator(
-        args.model, args.charge, args.spin_multiplicity
+    def bond_label(b, c):
+        return (
+            f"{conformer.mol.GetAtomWithIdx(b).GetSymbol()}{b + 1}-"
+            f"{conformer.mol.GetAtomWithIdx(c).GetSymbol()}{c + 1}"
+        )
+
+    # Resolve any --fix bonds (named by 1-indexed central atoms) to their 0-based
+    # central-bond pairs, validating against the actual rotatable bonds.
+    available = {frozenset((b + 1, c + 1)): (b, c) for _, b, c, _ in dihedrals}
+    all_labels = [bond_label(b, c) for _, b, c, _ in dihedrals]
+    fixed_bonds = []
+    for token in args.fix:
+        nums = re.findall(r"\d+", token)
+        if len(nums) != 2:
+            sys.exit(f"--fix value '{token}' must name two atoms, e.g. C5-O4 or 5-4")
+        key = frozenset((int(nums[0]), int(nums[1])))
+        if key not in available:
+            sys.exit(
+                f"--fix bond '{token}' is not a rotatable bond. "
+                f"Available: {', '.join(all_labels) or 'none'}"
+            )
+        fixed_bonds.append(available[key])
+
+    fixed_set = {frozenset(bc) for bc in fixed_bonds}
+    dihedrals = [d for d in dihedrals if frozenset((d[1], d[2])) not in fixed_set]
+    bond_labels = [bond_label(b, c) for _, b, c, _ in dihedrals]
+
+    console.print(
+        f"[bold]Molecular formula:[/] [cyan]{conformer.atoms.get_chemical_formula()}[/]"
     )
-    print(f"Model: {MODELS[args.model]}")
-    if device.startswith("cuda"):
-        print(f"GPU acceleration: yes ({device})")
+    console.print(f"[bold]Rotatable torsions:[/] {len(dihedrals)}")
+    if bond_labels:
+        console.print(f"[bold]Rotatable bonds:[/] [green]{', '.join(bond_labels)}[/]")
+    if fixed_bonds:
+        fixed_str = ", ".join(bond_label(b, c) for b, c in fixed_bonds)
+        console.print(f"[bold]Fixed bonds (not rotated):[/] [red]{fixed_str}[/]")
+    console.print(f"[bold]Estimated conformer space (3^N):[/] {3 ** len(dihedrals)}")
+
+    if args.model == "xtb-cli":
+        if shutil.which("xtb") is None:
+            sys.exit(
+                "xtb executable not found on PATH.\nInstall it with: "
+                "conda install -c conda-forge xtb"
+            )
+        device = "cpu"
+        calc = XTBCalculation(
+            charge=args.charge,
+            spin_multiplicity=args.spin_multiplicity,
+            opt_level=args.opt_level,
+        )
     else:
-        print(f"GPU acceleration: no (running on {device})")
-
-    calc = ASEOptimization(
-        calc=model_calc,
-        optimizer=OPTIMIZERS[args.optimizer],
-        fmax=args.fmax,
-    )
+        model_calc, device = build_calculator(
+            args.model, args.charge, args.spin_multiplicity
+        )
+        calc = ASEOptimization(
+            calc=model_calc,
+            optimizer=OPTIMIZERS[args.optimizer],
+            fmax=args.fmax,
+        )
+    console.print(f"[bold]Model:[/] {MODELS[args.model]}")
+    if device.startswith("cuda"):
+        console.print(f"[bold]GPU acceleration:[/] [green]yes ({device})[/]")
+    else:
+        console.print(f"[bold]GPU acceleration:[/] [yellow]no (running on {device})[/]")
 
     if not args.no_initial_optimization:
-        print("Running initial optimization...")
+        console.print("[bold]Running initial optimization...[/]")
         positions, global_min = calc.run(conformer.atoms)
         conformer.atoms.set_positions(positions)
-        print(f"Initial structure energy: {global_min / HARTREE_TO_KCAL:.6f} Eh")
+        console.print(
+            f"[bold]Initial structure energy:[/] {global_min / HARTREE_TO_KCAL:.6f} Eh"
+        )
     else:
         global_min = calc.energy(conformer.atoms)
-        print(
-            f"Initial structure energy (unoptimized): "
+        console.print(
+            f"[bold]Initial structure energy (unoptimized):[/] "
             f"{global_min / HARTREE_TO_KCAL:.6f} Eh"
         )
-    print(f"Monte Carlo steps: {args.steps}")
+    console.print(f"[bold]Monte Carlo steps:[/] {args.steps}")
 
     bar_width = 40
     acceptance_history = []
@@ -314,24 +437,31 @@ def main():
                     global_min = energy
                 guess = get_dihedral_angles(conformer.mol, dihedrals, initial)
                 final = get_dihedral_angles(conformer.mol, dihedrals, optimized)
-                verdict = "accepted" if accepted[i] else "rejected"
-                print(
-                    f"Step {first_step + i}/{args.steps}: "
+                if accepted[i]:
+                    verdict = "[green]accepted[/]"
+                else:
+                    verdict = "[red]rejected[/]"
+                console.print(
+                    f"[bold]Step {first_step + i}/{args.steps}:[/] "
                     f"energy: {energy / HARTREE_TO_KCAL:.6f} Eh "
-                    f"(rel: {energy - global_min:.2f} kcal/mol) [{verdict}] "
+                    f"(rel: {energy - global_min:.2f} kcal/mol) \\[{verdict}] "
                     f"(acc: {overall_rate:.0%}, last 10: {last_10_rate:.0%})"
                 )
-                print(f"  dihedral guess:      {format_angles(guess)}")
-                print(f"  optimized dihedrals: {format_angles(final)}")
+                console.print(
+                    f"  [dim]dihedral guess:      {escape(format_angles(guess))}[/]"
+                )
+                console.print(
+                    f"  [dim]optimized dihedrals: {escape(format_angles(final))}[/]"
+                )
                 if new_minimum:
-                    print("  *** new global minimum ***")
+                    console.print("  [bold yellow]*** new global minimum ***[/]")
         if len(acceptance_history) >= 10 and sum(acceptance_history[-10:]) == 0:
             stopped_early = True
             if args.quiet:
                 print()
-            print(
-                "No conformers accepted in the last 10 steps - "
-                "stopping search early"
+            console.print(
+                "[yellow]No conformers accepted in the last 10 steps - "
+                "stopping search early[/]"
             )
             return True
         return False
@@ -342,12 +472,20 @@ def main():
         num_iterations=args.steps,
         energy_window=args.energy_window,
         rmsd_threshold=args.rmsd_threshold,
+        uniqueness_method=args.uniqueness_method,
+        ethr=args.ethr,
+        rthr=args.rthr,
+        bthr=args.bthr,
+        bthrmax=args.bthrmax,
+        bthrshift=args.bthrshift,
         max_bonds_rotate=args.max_bonds_rotate,
         angle_step=args.angle_step,
         initial_optimization=False,
         parallel=args.parallel,
         num_cpus=args.num_cpus,
+        verbose=args.verbose,
         step_callback=report_step,
+        fixed_bonds=fixed_bonds,
     )
     ensemble.run_monte_carlo()
     if args.quiet and not stopped_early:
@@ -361,11 +499,49 @@ def main():
             for symbol, (x, y, z) in zip(symbols, positions):
                 f.write(f"{symbol:2s} {x:18.10f} {y:18.10f} {z:18.10f}\n")
 
-    print(f"Wrote {len(ensemble.final_ensemble)} conformers to {args.output}")
-    print(
-        f"Lowest energy conformer: "
-        f"{ensemble.final_energies[0] / HARTREE_TO_KCAL:.6f} Eh"
+    boltzmann_kcal = 0.0019872041  # kcal/(mol K)
+    temperature = 298.15
+    e_min = ensemble.final_energies[0]
+    rel_energies = [e - e_min for e in ensemble.final_energies]
+    weights = [math.exp(-de / (boltzmann_kcal * temperature)) for de in rel_energies]
+    total_weight = sum(weights)
+
+    console.print()
+    console.rule("[bold cyan]Final Ensemble Information[/]")
+    console.print(f"[bold]output file name[/]               : [cyan]{args.output}[/]")
+    console.print(
+        f"[bold]conformer energy window  /kcal[/] : {args.energy_window:8.4f}"
     )
+    console.print(
+        f"[bold]total number unique conformers[/] : {len(ensemble.final_ensemble):8d}"
+    )
+    console.print(
+        f"[bold]lowest energy conformer    /Eh[/] : "
+        f"[green]{e_min / HARTREE_TO_KCAL:.6f}[/]"
+    )
+
+    table = Table(box=box.SIMPLE_HEAVY, header_style="bold magenta", pad_edge=False)
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Erel/kcal", justify="right")
+    table.add_column("Etot/Eh", justify="right", style="cyan")
+    table.add_column("weight/tot", justify="right", style="green")
+    table.add_column("found", justify="right", style="yellow")
+    table.add_column("origin", justify="center")
+    for i, (energy, de, weight) in enumerate(
+        zip(ensemble.final_energies, rel_energies, weights)
+    ):
+        origin = ensemble.origin[i]
+        origin_cell = f"[blue]{origin}[/]" if origin == "input" else origin
+        table.add_row(
+            str(i + 1),
+            f"{de:.3f}",
+            f"{energy / HARTREE_TO_KCAL:.5f}",
+            f"{weight / total_weight:.5f}",
+            str(ensemble.found[i]),
+            origin_cell,
+            style="bold" if i == 0 else None,
+        )
+    console.print(table)
 
 
 if __name__ == "__main__":
