@@ -8,7 +8,7 @@ explore conformational space.
 
 import os
 import sys
-from typing import Optional, List, Tuple, Union
+from typing import Callable, Optional, List, Tuple, Union
 import random
 from copy import copy
 import logging
@@ -80,6 +80,7 @@ class ConformerEnsemble:
         verbose: Optional[bool] = False,
         parallel_batch_folder_location: Optional[str] = None,
         process_timeout: Optional[float] = 3600,
+        step_callback: Optional[Callable] = None,
     ) -> None:
         """Initialize the conformer ensemble generator.
 
@@ -128,6 +129,18 @@ class ConformerEnsemble:
             process_timeout: Maximum time in seconds to wait for each parallel batch
                 to complete. Processes that exceed this limit are terminated. Default
                 is 3600 (1 hour). Pass None to wait indefinitely.
+            step_callback: Optional callable invoked after each batch of Monte
+                Carlo optimizations with (steps_completed, initial_positions,
+                positions_and_energies, accepted), where steps_completed is the
+                number of Monte Carlo steps performed so far, initial_positions
+                is a list of pre-optimization coordinate arrays for the batch,
+                positions_and_energies is the corresponding list of
+                (optimized_positions, energy) tuples, and accepted is a list of
+                booleans indicating whether each conformer passed the energy,
+                identity, and RMSD checks and joined the ensemble. If the
+                callback returns a truthy value, the Monte Carlo search stops
+                early. Useful for progress reporting and convergence-based
+                stopping. Default is None.
         """
         self.conformer = conformer
         self.calc = calc
@@ -150,6 +163,7 @@ class ConformerEnsemble:
         self.verbose = verbose
         self.parallel_batch_folder_location = parallel_batch_folder_location
         self.process_timeout = process_timeout
+        self.step_callback = step_callback
         if self.num_cpus == 0:
             self.num_cpus = os.cpu_count()
         if self.verbose:
@@ -263,8 +277,12 @@ class ConformerEnsemble:
                     calculation_input.append(atoms_to_optimize)
             if len(calculation_input) == 0:
                 continue
+            # Capture pre-optimization coordinates before run_optimizations
+            # mutates the atoms objects in place
+            initial_positions = [atoms.get_positions() for atoms in calculation_input]
             positions_and_energies = self.run_optimizations(calculation_input)
             # Filter out high energy and duplicate conformers
+            accepted = []
             for positions, energy in positions_and_energies:
                 if self.check_conformer(
                     final_ensemble, final_energies, positions, energy
@@ -272,6 +290,19 @@ class ConformerEnsemble:
                     final_ensemble.append(positions)
                     final_energies.append(energy)
                     used.append(0)
+                    accepted.append(True)
+                else:
+                    accepted.append(False)
+            stop_requested = False
+            if self.step_callback is not None:
+                stop_requested = bool(
+                    self.step_callback(
+                        min(current_iter, self.num_iterations),
+                        initial_positions,
+                        positions_and_energies,
+                        accepted,
+                    )
+                )
 
             # Sort all of the lists by energies
             final_ensemble, used, final_energies = zip(
@@ -280,6 +311,10 @@ class ConformerEnsemble:
             final_ensemble = list(final_ensemble)
             used = list(used)
             final_energies = list(final_energies)
+
+            if stop_requested:
+                self.log_info("Search stopped early by step_callback")
+                break
 
         self.final_ensemble = final_ensemble
         self.final_energies = final_energies

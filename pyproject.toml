@@ -14,8 +14,12 @@ dependencies = [
 authors = [ { name = "Nicholas Casetti" } ]
 license = { file = "LICENSE" }
 
+[project.scripts]
+mcmm = "multiple_minimum_monte_carlo.mcmm:main"
+
 [dependency-groups]
 dev = [
+    "aimnet ; python_full_version >= '3.11'",
     "build>=1.2.2.post1",
     "ipykernel",
     "pytest",
@@ -30,3 +34,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = { find = { exclude = ["tests*"] } }
+
+[tool.uv.sources]
+aimnet = { git = "https://github.com/isayevlab/aimnetcentral.git" }
