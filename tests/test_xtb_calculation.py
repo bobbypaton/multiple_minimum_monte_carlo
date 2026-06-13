@@ -31,6 +31,12 @@ echo "[ERROR] Program stopped due to fatal error"
 exit 1
 """
 
+# Exits successfully but writes no xtbopt.xyz, mimicking an optimization that
+# did not converge to a written geometry.
+NO_OUTPUT_XTB = """#!/bin/sh
+echo "          | TOTAL ENERGY              -1.500000000000 Eh   |"
+"""
+
 # Records whether an xtbrestart file was present on entry (to RESTART_LOG), then
 # writes a fresh xtbrestart and an xtbopt.xyz so XTBCalculation.run succeeds.
 RESTART_XTB = """#!/bin/sh
@@ -161,6 +167,15 @@ def test_no_cache_restart_starts_fresh(tmp_path, monkeypatch):
     calc.run(DummyAtoms())
     # without caching, each fresh temp dir has no restart file
     assert rlog.read_text().split() == ["absent", "absent"]
+
+
+def test_missing_xtbopt_raises(tmp_path):
+    script = tmp_path / "xtb"
+    script.write_text(NO_OUTPUT_XTB)
+    script.chmod(0o755)
+    calc = XTBCalculation(xtb_path=str(script))
+    with pytest.raises(RuntimeError, match="xtbopt.xyz"):
+        calc.run(DummyAtoms())
 
 
 def test_unknown_method_raises():

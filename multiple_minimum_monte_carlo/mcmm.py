@@ -339,7 +339,8 @@ def parse_args():
     parser.add_argument(
         "--parallel",
         action="store_true",
-        help="Run optimizations in parallel (requires the 'fork' multiprocessing start method)",
+        help="Run optimizations in parallel using forked worker processes "
+        "(works best on Linux; macOS fork can be fragile with some calculators)",
     )
     parser.add_argument(
         "--num-cpus",

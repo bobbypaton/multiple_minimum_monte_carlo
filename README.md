@@ -101,7 +101,7 @@ By default a new conformer is considered unique when its RMSD to every existing 
 
 ### A note about parallel calculations
 
-As opposed to batched calculations, you can also do calculations in parallel with a Calculation object by setting parallel=True in the ConformerEnsemble object. However, this requires that the multiprocessing start method "fork" is used which may be incompatible with certain workflows.
+As opposed to batched calculations, you can also do calculations in parallel with a Calculation object by setting parallel=True in the ConformerEnsemble object. Worker processes are launched with the "fork" start method (selected explicitly, so it works regardless of the platform default), which lets workers inherit the calculator object rather than pickling it. Fork works best on Linux; on macOS it can be fragile with some calculators, and it is unavailable on Windows (where it falls back to the platform default).
 
 ### A note about just using input xyz structure
 

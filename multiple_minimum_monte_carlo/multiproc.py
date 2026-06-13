@@ -164,13 +164,23 @@ def parallel_run_proc(
     # Batch the input list
     batched_dicts = batch_dicts(input_list, num_workers)
 
+    # Explicitly use the "fork" start method: worker arguments include the
+    # calculator object and a (possibly local) callable, which fork inherits via
+    # the parent's memory rather than pickling. This is required for torch-based
+    # calculators that do not survive "spawn" (the default on macOS / Python 3.8+).
+    # Fall back to the platform default where fork is unavailable (e.g. Windows).
+    try:
+        ctx = mp.get_context("fork")
+    except ValueError:
+        ctx = mp.get_context()
+
     # Set up the queue and processes
-    queue = mp.Queue()
+    queue = ctx.Queue()
     num_processes = len(batched_dicts)
     processes = []
     rets = []
     for i in range(num_processes):
-        p = mp.Process(
+        p = ctx.Process(
             target=run_func,
             args=(func, batched_dicts[i], queue, parallel_batch_folder_location),
         )
