@@ -78,6 +78,9 @@ class ConformerEnsemble:
         bthr: Optional[float] = 0.01,
         bthrmax: Optional[float] = 0.025,
         bthrshift: Optional[float] = 0.5,
+        rmsd_heavy_only: Optional[bool] = True,
+        rmsd_symmetry: Optional[bool] = False,
+        detect_enantiomers: Optional[bool] = True,
         initial_optimization: Optional[bool] = True,
         random_walk: Optional[bool] = False,
         reduce_angle: Optional[bool] = False,
@@ -135,6 +138,26 @@ class ConformerEnsemble:
                 threshold in the "crest" method. Default is 0.025 (2.5%).
             bthrshift: Shift of the error-function ramp that maps anisotropy onto the
                 rotational-constant threshold in the "crest" method. Default is 0.5.
+            rmsd_heavy_only: If True, the duplicate-detection RMSD (both the "rmsd"
+                and "crest" methods) is computed over heavy atoms only, ignoring
+                hydrogens. This prevents methyl/hydroxyl/amine rotamers — which are
+                the same conformer but place H atoms differently — from inflating the
+                RMSD and surviving as spurious duplicates. Default is True. Set False
+                to recover the legacy all-atom RMSD.
+            rmsd_symmetry: If True, the duplicate-detection RMSD is computed with
+                rdMolAlign.GetBestRMS, which permutes topologically equivalent atoms
+                (e.g. ring flips, equivalent substituents) to find the minimal RMSD,
+                rather than using the fixed input atom ordering. More robust for
+                symmetric molecules but more expensive; the cost is bounded because
+                hydrogens are stripped first when rmsd_heavy_only is True. Default is
+                False.
+            detect_enantiomers: If True, when a candidate is not a duplicate of an
+                existing member by direct RMSD, its mirror image is also compared
+                (by reflecting its coordinates). A candidate whose inverted RMSD to a
+                member falls below the RMSD threshold is treated as a redundant
+                enantiomer: it is rejected like a duplicate, but logged as
+                "ENANTIOMER" rather than "DUPLICATE". Adds one extra RMSD evaluation
+                per surviving comparison. Default is True.
             initial_optimization: If True, perform a structure optimization on the
                 starting conformer before Monte Carlo sampling. Default is True.
             random_walk: If True, randomly select conformers from the ensemble for
@@ -164,16 +187,20 @@ class ConformerEnsemble:
                 is 3600 (1 hour). Pass None to wait indefinitely.
             step_callback: Optional callable invoked after each batch of Monte
                 Carlo optimizations with (steps_completed, initial_positions,
-                positions_and_energies, accepted), where steps_completed is the
-                number of Monte Carlo steps performed so far, initial_positions
-                is a list of pre-optimization coordinate arrays for the batch,
-                positions_and_energies is the corresponding list of
-                (optimized_positions, energy) tuples, and accepted is a list of
+                positions_and_energies, accepted, refined), where steps_completed
+                is the number of Monte Carlo steps performed so far,
+                initial_positions is a list of pre-optimization coordinate arrays
+                for the batch, positions_and_energies is the corresponding list of
+                (optimized_positions, energy) tuples, accepted is a list of
                 booleans indicating whether each conformer passed the energy,
-                identity, and RMSD checks and joined the ensemble. If the
-                callback returns a truthy value, the Monte Carlo search stops
-                early. Useful for progress reporting and convergence-based
-                stopping. Default is None.
+                identity, and RMSD checks and joined the ensemble as a new member,
+                and refined is a list of booleans indicating whether each
+                conformer was a duplicate that replaced an existing member because
+                it optimized to a lower energy. A conformer is retained in the
+                ensemble when its accepted or refined flag is True. If the callback
+                returns a truthy value, the Monte Carlo search stops early. Useful
+                for progress reporting and convergence-based stopping. Default is
+                None.
             fixed_bonds: Optional list of central-bond atom-index pairs (0-based)
                 to exclude from the rotatable dihedral list. A torsion is dropped
                 if its central b-c bond matches one of these pairs (in either
@@ -199,6 +226,10 @@ class ConformerEnsemble:
         self.bthr = bthr
         self.bthrmax = bthrmax
         self.bthrshift = bthrshift
+        self.rmsd_heavy_only = rmsd_heavy_only
+        self.rmsd_symmetry = rmsd_symmetry
+        self.detect_enantiomers = detect_enantiomers
+        self._setup_rmsd_comparison()
         self.initial_optimization = initial_optimization
         self.random_walk = random_walk
         self.reduce_angle = reduce_angle
@@ -357,6 +388,7 @@ class ConformerEnsemble:
             positions_and_energies = self.run_optimizations(calculation_input)
             # Filter out high energy and duplicate conformers
             accepted = []
+            refined = []
             for positions, energy in positions_and_energies:
                 if self.check_conformer(
                     final_ensemble, final_energies, positions, energy
@@ -367,12 +399,23 @@ class ConformerEnsemble:
                     found.append(1)
                     origin.append("mc")
                     accepted.append(True)
+                    refined.append(False)
                 else:
-                    # If it was rejected as a duplicate of an existing member,
-                    # bump that member's degeneracy count.
+                    # Rejected as a duplicate of an existing member: bump that
+                    # member's degeneracy count, and if this re-discovery
+                    # optimized to a lower energy, keep it as the cluster's
+                    # representative so the ensemble retains the lowest-energy
+                    # geometry of each conformer.
+                    was_refined = False
                     if self._duplicate_index is not None:
-                        found[self._duplicate_index] += 1
+                        idx = self._duplicate_index
+                        found[idx] += 1
+                        if energy < final_energies[idx]:
+                            final_ensemble[idx] = positions
+                            final_energies[idx] = energy
+                            was_refined = True
                     accepted.append(False)
+                    refined.append(was_refined)
             stop_requested = False
             if self.step_callback is not None:
                 stop_requested = bool(
@@ -381,6 +424,7 @@ class ConformerEnsemble:
                         initial_positions,
                         positions_and_energies,
                         accepted,
+                        refined,
                     )
                 )
 
@@ -553,6 +597,73 @@ class ConformerEnsemble:
         # If all distances are greater than or equal to 0, the conformer passes the constraint test
         return True
 
+    def _setup_rmsd_comparison(self) -> None:
+        """Precompute the atom set and template molecules for duplicate-detection RMSD.
+
+        The duplicate RMSD can be computed over heavy atoms only (``rmsd_heavy_only``,
+        so methyl/hydroxyl/amine rotamers don't inflate it) and/or with permutation of
+        topologically equivalent atoms (``rmsd_symmetry`` via ``GetBestRMS``). Building
+        the reusable probe/reference molecules once here keeps :meth:`_pairwise_rmsd`
+        cheap inside the per-member loop.
+        """
+        mol = self.conformer.mol
+        if self.rmsd_heavy_only:
+            self._rmsd_indices = np.array(
+                [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
+            )
+        else:
+            self._rmsd_indices = np.arange(mol.GetNumAtoms())
+        if self.rmsd_symmetry:
+            # GetBestRMS permutes equivalent atoms over the whole graph, so strip
+            # hydrogens up front when heavy-only to avoid permuting equivalent H's
+            # (the expensive, useless case) and to exclude them from the RMSD.
+            template = (
+                Chem.RemoveHs(Chem.Mol(mol)) if self.rmsd_heavy_only else Chem.Mol(mol)
+            )
+            self._rmsd_probe = Chem.Mol(template)
+            self._rmsd_ref = Chem.Mol(template)
+            self._rmsd_full_map = None
+        else:
+            # AlignMol uses the supplied atomMap for both fit and RMSD, so restricting
+            # the map to heavy atoms gives a heavy-atom alignment without stripping H.
+            self._rmsd_probe = Chem.Mol(mol)
+            self._rmsd_ref = Chem.Mol(mol)
+            self._rmsd_full_map = [(int(i), int(i)) for i in self._rmsd_indices]
+
+    def _pairwise_rmsd(
+        self,
+        cand_coords: np.ndarray,
+        ref_coords: np.ndarray,
+        invert: bool = False,
+    ) -> float:
+        """RMSD (Angstroms) between two conformers under the configured options.
+
+        Honors ``rmsd_heavy_only`` (heavy atoms only) and ``rmsd_symmetry`` (permute
+        topologically equivalent atoms). Reuses the template molecules built in
+        :meth:`_setup_rmsd_comparison`, overwriting their coordinates each call.
+
+        If ``invert`` is True the candidate coordinates are reflected through their
+        origin before alignment, so the returned RMSD measures how well the
+        candidate's mirror image overlays the reference. Combined with the
+        proper-rotation best fit that AlignMol/GetBestRMS perform, a small inverted
+        RMSD identifies an enantiomeric (mirror-image) relationship.
+        """
+        if invert:
+            cand_coords = -cand_coords
+        if self.rmsd_symmetry:
+            cheminformatics.add_coords_to_mol(
+                cand_coords[self._rmsd_indices], self._rmsd_probe
+            )
+            cheminformatics.add_coords_to_mol(
+                ref_coords[self._rmsd_indices], self._rmsd_ref
+            )
+            return rdMolAlign.GetBestRMS(self._rmsd_probe, self._rmsd_ref)
+        cheminformatics.add_coords_to_mol(cand_coords, self._rmsd_probe)
+        cheminformatics.add_coords_to_mol(ref_coords, self._rmsd_ref)
+        return rdMolAlign.AlignMol(
+            self._rmsd_probe, self._rmsd_ref, atomMap=self._rmsd_full_map
+        )
+
     def check_conformer(
         self,
         ensemble: List[np.ndarray],
@@ -607,10 +718,6 @@ class ConformerEnsemble:
         if not identity:
             self.log_info("  rejected: connectivity changed (identity check failed)")
             return False
-        temp_mol = copy(self.conformer.mol)
-        temp_mol = cheminformatics.add_coords_to_mol(conf, temp_mol)
-        temp_reference_mol = copy(self.conformer.mol)
-        atom_map = [(i, i) for i in range(len(temp_mol.GetAtoms()))]
         if self.uniqueness_method == "crest":
             masses = self.conformer.atoms.get_masses()
             candidate_rot = cheminformatics.rotational_constants(conf, masses)
@@ -622,9 +729,8 @@ class ConformerEnsemble:
                 # duplicate only if all three match.
                 delta_e = abs(energy - reference_energy)
                 if delta_e >= self.ethr:
-                    self.log_info(
-                        f"  vs #{idx}: dE={delta_e:.4f} >= ethr {self.ethr} -> distinct"
-                    )
+                    # Energy alone separates them; skip logging to avoid drowning
+                    # the verbose output in the (typically many) far-energy members.
                     continue
                 reference_rot = cheminformatics.rotational_constants(
                     reference_conf, masses
@@ -645,12 +751,7 @@ class ConformerEnsemble:
                             f"rot |dB|max={rot_max:.4f} mismatch -> distinct"
                         )
                     continue
-                temp_reference_mol = cheminformatics.add_coords_to_mol(
-                    reference_conf, temp_reference_mol
-                )
-                rmsd = rdMolAlign.AlignMol(
-                    temp_mol, temp_reference_mol, atomMap=atom_map
-                )
+                rmsd = self._pairwise_rmsd(conf, reference_conf)
                 if rmsd < self.rthr:
                     self.log_info(
                         f"  vs #{idx}: dE={delta_e:.4f} < ethr, rot match, "
@@ -658,6 +759,16 @@ class ConformerEnsemble:
                     )
                     self._duplicate_index = idx
                     return False
+                if self.detect_enantiomers:
+                    inv_rmsd = self._pairwise_rmsd(conf, reference_conf, invert=True)
+                    if inv_rmsd < self.rthr:
+                        self.log_info(
+                            f"  vs #{idx}: dE={delta_e:.4f} < ethr, rot match, "
+                            f"rmsd={rmsd:.4f} >= rthr but inverted "
+                            f"rmsd={inv_rmsd:.4f} < rthr {self.rthr} -> ENANTIOMER"
+                        )
+                        self._duplicate_index = idx
+                        return False
                 self.log_info(
                     f"  vs #{idx}: dE={delta_e:.4f} < ethr, rot match, "
                     f"rmsd={rmsd:.4f} >= rthr {self.rthr} -> distinct"
@@ -665,10 +776,7 @@ class ConformerEnsemble:
             self.log_info("  accepted: distinct from all members")
             return True
         for idx, reference_conf in enumerate(ensemble):
-            temp_reference_mol = cheminformatics.add_coords_to_mol(
-                reference_conf, temp_reference_mol
-            )
-            rmsd = rdMolAlign.AlignMol(temp_mol, temp_reference_mol, atomMap=atom_map)
+            rmsd = self._pairwise_rmsd(conf, reference_conf)
             if rmsd < self.rmsd_threshold:
                 self.log_info(
                     f"  vs #{idx}: rmsd={rmsd:.4f} < threshold "
@@ -676,6 +784,16 @@ class ConformerEnsemble:
                 )
                 self._duplicate_index = idx
                 return False
+            if self.detect_enantiomers:
+                inv_rmsd = self._pairwise_rmsd(conf, reference_conf, invert=True)
+                if inv_rmsd < self.rmsd_threshold:
+                    self.log_info(
+                        f"  vs #{idx}: rmsd={rmsd:.4f} >= threshold but inverted "
+                        f"rmsd={inv_rmsd:.4f} < threshold "
+                        f"{self.rmsd_threshold} -> ENANTIOMER"
+                    )
+                    self._duplicate_index = idx
+                    return False
             self.log_info(
                 f"  vs #{idx}: rmsd={rmsd:.4f} >= threshold "
                 f"{self.rmsd_threshold} -> distinct"

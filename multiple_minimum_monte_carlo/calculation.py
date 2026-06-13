@@ -156,7 +156,8 @@ class XTBCalculation(Calculation):
     Attributes:
         charge: Formal charge of the molecule.
         spin_multiplicity: Spin multiplicity (2S+1) of the molecule.
-        method: xTB Hamiltonian, one of "gfn0", "gfn1", "gfn2", or "gfnff".
+        method: xTB Hamiltonian, one of "gfn0", "gfn1", "gfn2", "gfnff", or
+            "gxtb" (g-xTB; requires an xtb build that supports --gxtb).
         opt_level: xtb optimization convergence level (crude, sloppy, loose,
             normal, tight, vtight, extreme).
         solvent: Implicit solvent name for the ALPB model, or None for gas phase.
@@ -171,6 +172,7 @@ class XTBCalculation(Calculation):
         "gfn1": ["--gfn", "1"],
         "gfn2": ["--gfn", "2"],
         "gfnff": ["--gfnff"],
+        "gxtb": ["--gxtb"],
     }
 
     def __init__(
@@ -189,7 +191,9 @@ class XTBCalculation(Calculation):
         Args:
             charge: Formal charge of the molecule. Default is 0.
             spin_multiplicity: Spin multiplicity 2S+1. Default is 1 (singlet).
-            method: xTB Hamiltonian: "gfn0", "gfn1", "gfn2", or "gfnff".
+            method: xTB Hamiltonian: "gfn0", "gfn1", "gfn2", "gfnff", or "gxtb".
+                "gxtb" selects the g-xTB method and requires an xtb build that
+                supports the --gxtb flag (set xtb_path accordingly).
                 Default is "gfn2".
             opt_level: Convergence level passed to ``xtb --opt``. One of
                 crude, sloppy, loose, normal, tight, vtight, extreme.

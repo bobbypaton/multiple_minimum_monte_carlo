@@ -113,6 +113,16 @@ def test_failed_run_raises(tmp_path):
         calc.run(DummyAtoms())
 
 
+def test_gxtb_method_passes_flag(fake_xtb):
+    script, log = fake_xtb
+    calc = XTBCalculation(method="gxtb", xtb_path=str(script))
+    calc.run(DummyAtoms())
+    args = log.read_text()
+    assert "--gxtb" in args
+    # g-xTB must not also pass a --gfn Hamiltonian selector
+    assert "--gfn " not in args
+
+
 def test_unknown_method_raises():
     with pytest.raises(ValueError, match="gfn3"):
         XTBCalculation(method="gfn3")

@@ -18,9 +18,11 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 from copy import copy
 
+import numpy as np
 from ase.optimize import BFGS, FIRE, LBFGS
 from rdkit.Chem import rdMolTransforms
 from rich import box
@@ -43,6 +45,7 @@ MODELS = {
     "ani2x": "ANI-2x",
     "xtb": "GFN2-xTB",
     "xtb-cli": "GFN2-xTB (xtb binary)",
+    "gxtb-cli": "g-xTB (xtb binary)",
     "uma": "UMA (FairChem)",
 }
 
@@ -216,6 +219,29 @@ def parse_args():
         "widens from bthr toward bthrmax for the 'crest' method (default: 0.5)",
     )
     parser.add_argument(
+        "--rmsd-all-atom",
+        action="store_true",
+        help="Include hydrogens in the duplicate-detection RMSD (both 'rmsd' and "
+        "'crest' methods). By default the RMSD is heavy-atom only, so methyl/hydroxyl "
+        "rotamers are not counted as distinct conformers; pass this to restore the "
+        "legacy all-atom RMSD",
+    )
+    parser.add_argument(
+        "--rmsd-symmetry",
+        action="store_true",
+        help="Permute topologically equivalent atoms (ring flips, equivalent "
+        "substituents) when computing the duplicate-detection RMSD, via RDKit's "
+        "GetBestRMS. More robust for symmetric molecules but slower (default: off)",
+    )
+    parser.add_argument(
+        "--no-detect-enantiomers",
+        action="store_true",
+        help="Disable enantiomer detection. By default each candidate's mirror image "
+        "is also compared, and a conformer matching an existing member only after "
+        "inversion is rejected as a redundant enantiomer (logged as ENANTIOMER rather "
+        "than DUPLICATE); pass this to keep such mirror-image conformers",
+    )
+    parser.add_argument(
         "--max-bonds-rotate",
         type=int,
         default=3,
@@ -244,7 +270,9 @@ def parse_args():
         default="aimnet2",
         help="Energy model to use (default: aimnet2). Each backend needs its own "
         "package: aimnet2 (aimnet), mace-off (mace-torch), ani2x (torchani), "
-        "xtb (tblite), xtb-cli (the xtb executable on PATH), uma (fairchem-core)",
+        "xtb (tblite), xtb-cli (the xtb executable, GFN2), gxtb-cli (the xtb "
+        "executable run with --gxtb; needs a build supporting it, see --xtb-path), "
+        "uma (fairchem-core)",
     )
     parser.add_argument(
         "--optimizer",
@@ -263,9 +291,16 @@ def parse_args():
     parser.add_argument(
         "--opt-level",
         choices=("crude", "sloppy", "loose", "normal", "tight", "vtight", "extreme"),
-        default="normal",
-        help="Optimization convergence level for the xtb-cli model "
-        "(default: normal); other models use --fmax",
+        default="tight",
+        help="Optimization convergence level for the xtb-cli and gxtb-cli models "
+        "(default: tight); other models use --fmax",
+    )
+    parser.add_argument(
+        "--xtb-path",
+        default=None,
+        help="Path to the xtb executable for the xtb-cli and gxtb-cli models. "
+        "If omitted, xtb-cli uses 'xtb' on PATH; gxtb-cli auto-detects a "
+        "g-xTB-capable build, searching $XTBHOME/bin/xtb, ~/xtb/bin/xtb, then PATH",
     )
     parser.add_argument(
         "--no-initial-optimization",
@@ -281,7 +316,17 @@ def parse_args():
         "--num-cpus",
         type=int,
         default=0,
-        help="CPUs for parallel mode; 0 uses all available (default: 0)",
+        help="Number of conformer optimizations to run concurrently in --parallel "
+        "mode; 0 uses all available cores (default: 0). Each runs as its own process",
+    )
+    parser.add_argument(
+        "--xtb-threads",
+        type=int,
+        default=1,
+        help="OpenMP threads per xtb process for the xtb-cli and gxtb-cli models "
+        "(default: 1). Use this to give a single optimization more cores; keep it "
+        "at 1 with --parallel to avoid oversubscribing (total load is "
+        "num-cpus x xtb-threads)",
     )
     parser.add_argument(
         "--quiet",
@@ -307,6 +352,89 @@ def get_dihedral_angles(mol, dihedrals, positions):
 
 def format_angles(angles):
     return "[" + ", ".join(f"{angle:7.1f}" for angle in angles) + "]"
+
+
+def _xtb_supports_gxtb(exe):
+    """Return True if the xtb executable advertises the --gxtb flag."""
+    try:
+        result = subprocess.run(
+            [exe, "--help"], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "--gxtb" in result.stdout
+
+
+def resolve_xtb_path(requested, require_gxtb):
+    """Resolve the xtb executable for the xtb-cli / gxtb-cli backends.
+
+    If ``requested`` is given it is the only candidate (and is validated). When
+    it is None, xtb-cli falls back to ``xtb`` on PATH, while gxtb-cli auto-detects
+    a g-xTB-capable build from standard install locations. Exits with a helpful
+    message if no suitable executable is found.
+    """
+    if requested is not None:
+        exe = shutil.which(requested)
+        if exe is None:
+            sys.exit(
+                f"xtb executable not found: {requested!r}.\n"
+                "Install it with: conda install -c conda-forge xtb, or pass a "
+                "valid path with --xtb-path."
+            )
+        if require_gxtb and not _xtb_supports_gxtb(exe):
+            sys.exit(
+                f"The xtb at {exe} does not support --gxtb.\n"
+                "Point --xtb-path at a build that implements g-xTB "
+                "(e.g. ~/xtb/bin/xtb)."
+            )
+        return exe
+    if not require_gxtb:
+        exe = shutil.which("xtb")
+        if exe is None:
+            sys.exit(
+                "xtb executable not found on PATH.\nInstall it with: "
+                "conda install -c conda-forge xtb, or pass a path with --xtb-path."
+            )
+        return exe
+    # gxtb-cli with no explicit path: search standard locations for a g-xTB build.
+    candidates = []
+    if os.environ.get("XTBHOME"):
+        candidates.append(os.path.join(os.environ["XTBHOME"], "bin", "xtb"))
+    candidates.append(os.path.expanduser("~/xtb/bin/xtb"))
+    candidates.append("xtb")
+    searched = []
+    for candidate in candidates:
+        exe = shutil.which(candidate)
+        if exe is None or exe in searched:
+            continue
+        searched.append(exe)
+        if _xtb_supports_gxtb(exe):
+            return exe
+    searched_str = ", ".join(searched) if searched else "(none found)"
+    sys.exit(
+        "No xtb build supporting --gxtb was found.\n"
+        f"Searched: {searched_str}.\n"
+        "Point --xtb-path at a g-xTB build (e.g. ~/xtb/bin/xtb)."
+    )
+
+
+def print_pairwise_matrix(title, n, value_fn, fmt="{:.3f}"):
+    """Print an upper-triangle pairwise matrix over the final conformers.
+
+    value_fn(i, j) returns the scalar shown for the (i, j) pair (i < j); the
+    diagonal and lower triangle are left blank.
+    """
+    console.print(f"\n[bold]{title}[/]")
+    matrix = Table(box=box.SIMPLE, header_style="bold magenta", pad_edge=False)
+    matrix.add_column("", justify="right", style="dim")
+    for j in range(n):
+        matrix.add_column(str(j + 1), justify="right")
+    for i in range(n):
+        cells = [str(i + 1)]
+        for j in range(n):
+            cells.append(fmt.format(value_fn(i, j)) if j > i else "")
+        matrix.add_row(*cells)
+    console.print(matrix)
 
 
 def main():
@@ -363,17 +491,18 @@ def main():
         console.print(f"[bold]Fixed bonds (not rotated):[/] [red]{fixed_str}[/]")
     console.print(f"[bold]Estimated conformer space (3^N):[/] {3 ** len(dihedrals)}")
 
-    if args.model == "xtb-cli":
-        if shutil.which("xtb") is None:
-            sys.exit(
-                "xtb executable not found on PATH.\nInstall it with: "
-                "conda install -c conda-forge xtb"
-            )
+    if args.model in ("xtb-cli", "gxtb-cli"):
+        method = "gxtb" if args.model == "gxtb-cli" else "gfn2"
+        xtb_exe = resolve_xtb_path(args.xtb_path, require_gxtb=method == "gxtb")
+        console.print(f"[bold]xtb binary:[/] [cyan]{xtb_exe}[/]")
         device = "cpu"
         calc = XTBCalculation(
             charge=args.charge,
             spin_multiplicity=args.spin_multiplicity,
+            method=method,
             opt_level=args.opt_level,
+            n_threads=args.xtb_threads,
+            xtb_path=xtb_exe,
         )
     else:
         model_calc, device = build_calculator(
@@ -409,14 +538,22 @@ def main():
     acceptance_history = []
     stopped_early = False
 
-    def report_step(steps_done, initial_positions, results, accepted):
+    def report_step(steps_done, initial_positions, results, accepted, refined):
         nonlocal global_min, stopped_early
         acceptance_history.extend(accepted)
         overall_rate = sum(acceptance_history) / len(acceptance_history)
         last_10 = acceptance_history[-10:]
         last_10_rate = sum(last_10) / len(last_10)
+        # Only structures kept in the ensemble (accepted as new, or a lower-energy
+        # duplicate that refined an existing member) can set the global minimum.
+        retained_energies = [
+            energy
+            for (_, energy), acc, ref in zip(results, accepted, refined)
+            if acc or ref
+        ]
         if args.quiet:
-            global_min = min(global_min, *(energy for _, energy in results))
+            if retained_energies:
+                global_min = min(global_min, *retained_energies)
             filled = bar_width * steps_done // args.steps
             print(
                 f"\r[{'#' * filled}{'-' * (bar_width - filled)}] "
@@ -432,13 +569,16 @@ def main():
             for i, (initial, (optimized, energy)) in enumerate(
                 zip(initial_positions, results)
             ):
-                new_minimum = energy < global_min
+                retained = accepted[i] or refined[i]
+                new_minimum = retained and energy < global_min
                 if new_minimum:
                     global_min = energy
                 guess = get_dihedral_angles(conformer.mol, dihedrals, initial)
                 final = get_dihedral_angles(conformer.mol, dihedrals, optimized)
                 if accepted[i]:
                     verdict = "[green]accepted[/]"
+                elif refined[i]:
+                    verdict = "[yellow]refined[/]"
                 else:
                     verdict = "[red]rejected[/]"
                 console.print(
@@ -454,7 +594,13 @@ def main():
                     f"  [dim]optimized dihedrals: {escape(format_angles(final))}[/]"
                 )
                 if new_minimum:
-                    console.print("  [bold yellow]*** new global minimum ***[/]")
+                    if accepted[i]:
+                        console.print("  [bold yellow]*** new global minimum ***[/]")
+                    else:
+                        console.print(
+                            "  [bold yellow]*** new global minimum "
+                            "(refined existing conformer) ***[/]"
+                        )
         if len(acceptance_history) >= 10 and sum(acceptance_history[-10:]) == 0:
             stopped_early = True
             if args.quiet:
@@ -478,6 +624,9 @@ def main():
         bthr=args.bthr,
         bthrmax=args.bthrmax,
         bthrshift=args.bthrshift,
+        rmsd_heavy_only=not args.rmsd_all_atom,
+        rmsd_symmetry=args.rmsd_symmetry,
+        detect_enantiomers=not args.no_detect_enantiomers,
         max_bonds_rotate=args.max_bonds_rotate,
         angle_step=args.angle_step,
         initial_optimization=False,
@@ -542,6 +691,28 @@ def main():
             style="bold" if i == 0 else None,
         )
     console.print(table)
+
+    if args.verbose and len(ensemble.final_ensemble) >= 2:
+        n = len(ensemble.final_ensemble)
+        masses = ensemble.conformer.atoms.get_masses()
+        rots = [
+            cheminformatics.rotational_constants(positions, masses)
+            for positions in ensemble.final_ensemble
+        ]
+        print_pairwise_matrix(
+            "Pairwise |dB|max (max relative rotational-constant difference)",
+            n,
+            lambda i, j: float(np.max(np.abs(rots[i] / rots[j] - 1.0))),
+            fmt="{:.4f}",
+        )
+        print_pairwise_matrix(
+            "Pairwise RMSD / Angstrom",
+            n,
+            lambda i, j: ensemble._pairwise_rmsd(
+                ensemble.final_ensemble[i], ensemble.final_ensemble[j]
+            ),
+            fmt="{:.3f}",
+        )
 
 
 if __name__ == "__main__":
