@@ -31,7 +31,11 @@ from rich.markup import escape
 from rich.table import Table
 
 from multiple_minimum_monte_carlo import cheminformatics
-from multiple_minimum_monte_carlo.calculation import ASEOptimization, XTBCalculation
+from multiple_minimum_monte_carlo.calculation import (
+    HARTREE_TO_KCAL,
+    ASEOptimization,
+    XTBCalculation,
+)
 from multiple_minimum_monte_carlo.conformer import Conformer
 from multiple_minimum_monte_carlo.conformer_ensemble import ConformerEnsemble
 
@@ -44,13 +48,10 @@ MODELS = {
     "mace-off": "MACE-OFF",
     "ani2x": "ANI-2x",
     "xtb": "GFN2-xTB",
-    "xtb-cli": "GFN2-xTB (xtb binary)",
+    "xtb-cli": "xtb binary",
     "gxtb-cli": "g-xTB (xtb binary)",
     "uma": "UMA (FairChem)",
 }
-
-HARTREE_TO_KCAL = 627.5094740631
-"""float: Conversion factor from hartree to kilocalories per mole."""
 
 
 def build_calculator(name, charge, spin_multiplicity):
@@ -303,6 +304,34 @@ def parse_args():
         "g-xTB-capable build, searching $XTBHOME/bin/xtb, ~/xtb/bin/xtb, then PATH",
     )
     parser.add_argument(
+        "--xtb-method",
+        choices=("gfn0", "gfn1", "gfn2", "gfnff"),
+        default="gfn2",
+        help="xTB Hamiltonian for the xtb-cli model (default: gfn2). Ignored by "
+        "gxtb-cli, which always uses g-xTB",
+    )
+    parser.add_argument(
+        "--solvent",
+        default=None,
+        help="ALPB implicit solvent name for the xtb-cli and gxtb-cli models "
+        "(e.g. water, toluene); omit for gas phase (default: gas phase)",
+    )
+    parser.add_argument(
+        "--xtb-max-cycles",
+        type=int,
+        default=None,
+        help="Maximum geometry optimization cycles for the xtb-cli and gxtb-cli "
+        "models; omit to use xtb's automatic default",
+    )
+    parser.add_argument(
+        "--xtb-reuse-restart",
+        action="store_true",
+        help="Reuse the xtb wavefunction restart between steps for the xtb-cli and "
+        "gxtb-cli models. Seeds each SCF with the previous structure's result, "
+        "speeding convergence (most useful for g-xTB). Off by default for exact "
+        "reproducibility",
+    )
+    parser.add_argument(
         "--no-initial-optimization",
         action="store_true",
         help="Skip the optimization of the input structure before sampling",
@@ -443,13 +472,24 @@ def main():
         root, _ = os.path.splitext(args.input_xyz)
         args.output = f"{root}_mcmm.xyz"
 
-    conformer = Conformer(
-        smiles=args.smiles,
-        mapped=args.mapped,
-        input_xyz=args.input_xyz,
-        charge=args.charge,
-        spin_multiplicity=args.spin_multiplicity,
-    )
+    if not os.path.isfile(args.input_xyz):
+        sys.exit(f"Input file not found: {args.input_xyz}")
+
+    try:
+        conformer = Conformer(
+            smiles=args.smiles,
+            mapped=args.mapped,
+            input_xyz=args.input_xyz,
+            charge=args.charge,
+            spin_multiplicity=args.spin_multiplicity,
+        )
+    except Exception as exc:
+        sys.exit(
+            f"Failed to build the molecule from {args.input_xyz!r}: {exc}\n"
+            "Check that the file is a valid XYZ and that --charge is correct "
+            "(it drives bond perception). For ambiguous bonding, pass --smiles "
+            "(add --mapped if the SMILES is atom-mapped to the XYZ)."
+        )
 
     dihedrals = cheminformatics.get_dihedral_matches(conformer.mol, False)
 
@@ -492,7 +532,7 @@ def main():
     console.print(f"[bold]Estimated conformer space (3^N):[/] {3 ** len(dihedrals)}")
 
     if args.model in ("xtb-cli", "gxtb-cli"):
-        method = "gxtb" if args.model == "gxtb-cli" else "gfn2"
+        method = "gxtb" if args.model == "gxtb-cli" else args.xtb_method
         xtb_exe = resolve_xtb_path(args.xtb_path, require_gxtb=method == "gxtb")
         console.print(f"[bold]xtb binary:[/] [cyan]{xtb_exe}[/]")
         device = "cpu"
@@ -501,8 +541,11 @@ def main():
             spin_multiplicity=args.spin_multiplicity,
             method=method,
             opt_level=args.opt_level,
+            solvent=args.solvent,
+            max_cycles=args.xtb_max_cycles,
             n_threads=args.xtb_threads,
             xtb_path=xtb_exe,
+            cache_restart=args.xtb_reuse_restart,
         )
     else:
         model_calc, device = build_calculator(
@@ -514,6 +557,9 @@ def main():
             fmax=args.fmax,
         )
     console.print(f"[bold]Model:[/] {MODELS[args.model]}")
+    if args.model in ("xtb-cli", "gxtb-cli"):
+        solvent_str = args.solvent if args.solvent else "gas phase"
+        console.print(f"[bold]xtb method:[/] {method}  [bold]solvent:[/] {solvent_str}")
     if device.startswith("cuda"):
         console.print(f"[bold]GPU acceleration:[/] [green]yes ({device})[/]")
     else:

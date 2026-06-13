@@ -31,6 +31,19 @@ echo "[ERROR] Program stopped due to fatal error"
 exit 1
 """
 
+# Records whether an xtbrestart file was present on entry (to RESTART_LOG), then
+# writes a fresh xtbrestart and an xtbopt.xyz so XTBCalculation.run succeeds.
+RESTART_XTB = """#!/bin/sh
+if [ -f xtbrestart ]; then echo present >> "$RESTART_LOG"; else echo absent >> "$RESTART_LOG"; fi
+echo data > xtbrestart
+cat > xtbopt.xyz <<EOF
+2
+ energy: -1.500000000000 gnorm: 0.000000000000 xtb: 6.7.1 (fake)
+H         0.0000000000    0.0000000000    0.1000000000
+H         0.0000000000    0.0000000000    0.8500000000
+EOF
+"""
+
 
 class DummyAtoms:
     def get_chemical_symbols(self):
@@ -121,6 +134,33 @@ def test_gxtb_method_passes_flag(fake_xtb):
     assert "--gxtb" in args
     # g-xTB must not also pass a --gfn Hamiltonian selector
     assert "--gfn " not in args
+
+
+def _make_restart_xtb(tmp_path, monkeypatch):
+    script = tmp_path / "xtb"
+    script.write_text(RESTART_XTB)
+    script.chmod(0o755)
+    rlog = tmp_path / "restart.log"
+    monkeypatch.setenv("RESTART_LOG", str(rlog))
+    return script, rlog
+
+
+def test_cache_restart_reuses_wavefunction(tmp_path, monkeypatch):
+    script, rlog = _make_restart_xtb(tmp_path, monkeypatch)
+    calc = XTBCalculation(xtb_path=str(script), cache_restart=True)
+    calc.run(DummyAtoms())
+    calc.run(DummyAtoms())
+    # first call has no prior restart; second call is seeded from the cached one
+    assert rlog.read_text().split() == ["absent", "present"]
+
+
+def test_no_cache_restart_starts_fresh(tmp_path, monkeypatch):
+    script, rlog = _make_restart_xtb(tmp_path, monkeypatch)
+    calc = XTBCalculation(xtb_path=str(script), cache_restart=False)
+    calc.run(DummyAtoms())
+    calc.run(DummyAtoms())
+    # without caching, each fresh temp dir has no restart file
+    assert rlog.read_text().split() == ["absent", "absent"]
 
 
 def test_unknown_method_raises():

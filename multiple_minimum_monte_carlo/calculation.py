@@ -185,6 +185,7 @@ class XTBCalculation(Calculation):
         max_cycles: Optional[int] = None,
         n_threads: int = 1,
         xtb_path: str = "xtb",
+        cache_restart: bool = False,
     ) -> None:
         """Initialize the xtb command-line calculation.
 
@@ -207,6 +208,13 @@ class XTBCalculation(Calculation):
                 oversubscription. Default is 1.
             xtb_path: Path to the xtb executable. Default is "xtb" (found on
                 the PATH).
+            cache_restart: If True, carry the xtb wavefunction restart file
+                (``xtbrestart``) from one call to the next, seeding each SCF with
+                the previous result. Because successive Monte Carlo structures are
+                geometrically similar, this speeds SCF convergence (most useful for
+                the more expensive g-xTB method). The cache lives on the instance,
+                so each parallel worker (which holds its own copy) keeps its own
+                restart with no cross-process clobbering. Default is False.
         """
         if method not in self.METHOD_FLAGS:
             raise ValueError(
@@ -221,6 +229,10 @@ class XTBCalculation(Calculation):
         self.max_cycles = max_cycles
         self.n_threads = n_threads
         self.xtb_path = xtb_path
+        self.cache_restart = cache_restart
+        # Cached contents of the previous run's xtbrestart file, reused as the SCF
+        # guess for the next call when cache_restart is True.
+        self._restart_data = None
 
     def _execute(self, atoms: ase.Atoms, extra_args: List[str], run_dir: str) -> str:
         """Write the geometry and run xtb in run_dir, returning its stdout."""
@@ -230,6 +242,12 @@ class XTBCalculation(Calculation):
             f.write(f"{len(symbols)}\n\n")
             for symbol, (x, y, z) in zip(symbols, positions):
                 f.write(f"{symbol} {x:.10f} {y:.10f} {z:.10f}\n")
+        # Seed the SCF from the previous call's wavefunction; xtb auto-reads a
+        # file named "xtbrestart" present in the working directory.
+        restart_path = os.path.join(run_dir, "xtbrestart")
+        if self.cache_restart and self._restart_data is not None:
+            with open(restart_path, "wb") as f:
+                f.write(self._restart_data)
         command = [
             self.xtb_path,
             "input.xyz",
@@ -257,6 +275,10 @@ class XTBCalculation(Calculation):
             raise RuntimeError(
                 f"xtb exited with code {result.returncode}:\n{tail}\n{result.stderr}"
             )
+        # Persist the updated wavefunction for the next call's SCF guess.
+        if self.cache_restart and os.path.exists(restart_path):
+            with open(restart_path, "rb") as f:
+                self._restart_data = f.read()
         return result.stdout
 
     def run(

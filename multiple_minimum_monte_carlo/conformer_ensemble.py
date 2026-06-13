@@ -230,6 +230,10 @@ class ConformerEnsemble:
         self.rmsd_symmetry = rmsd_symmetry
         self.detect_enantiomers = detect_enantiomers
         self._setup_rmsd_comparison()
+        self._setup_constraint_test()
+        # Atomic masses are constant for the molecule; cached lazily on first use
+        # for the rotational constants in the crest uniqueness check (hot path).
+        self._masses = None
         self.initial_optimization = initial_optimization
         self.random_walk = random_walk
         self.reduce_angle = reduce_angle
@@ -335,8 +339,10 @@ class ConformerEnsemble:
         ]
         self.log_info(f"Rotating {len(dihedrals)} bond(s): {', '.join(bond_labels)}")
 
-        # Initialize information for identity checking
-        # TODO: halides are weird with bond formation occasionally so they are currently gnore
+        # Initialize information for identity checking. Bonds involving halides
+        # (and metals) are treated specially in check_identity_mc: changes to
+        # halide bonding are tolerated, since it is perceived unreliably as the
+        # geometry is perturbed and would otherwise cause false identity failures.
         self.original_bonds, self.metal_atoms, self.halides = (
             cheminformatics.initialize_mc_identity_check(
                 self.conformer.atoms, self.conformer.mol
@@ -536,19 +542,20 @@ class ConformerEnsemble:
                 - The resulting np.ndarray with the coordinates of the modified conformer.
         """
         success = False
+        # Reuse one scratch molecule across attempts: each attempt resets its
+        # coordinates to the input geometry and applies a fresh random rotation,
+        # avoiding a full RDKit mol copy on every attempt (up to max_attempts).
+        scratch_mol = copy(self.conformer.mol)
+        scratch_conf = scratch_mol.GetConformer()
         for _ in range(self.max_attempts):
-            temp_mol = copy(self.conformer.mol)
-            temp_mol = cheminformatics.add_coords_to_mol(conformer, temp_mol)
+            cheminformatics.add_coords_to_mol(conformer, scratch_mol)
             num_dihedrals = random.randint(1, self.max_bonds_rotate)
             dihedrals = random.choices(all_dihedrals, k=num_dihedrals)
-            cheminformatics.rotate_dihedrals(
-                temp_mol.GetConformer(), dihedrals, self.angle_step
-            )
-            if self.constraint_test(temp_mol.GetConformer()):
+            cheminformatics.rotate_dihedrals(scratch_conf, dihedrals, self.angle_step)
+            if self.constraint_test(scratch_conf):
                 success = True
                 break
-        atoms = cheminformatics.mol_to_ase_atoms(temp_mol)
-        return success, atoms.get_positions()
+        return success, scratch_conf.GetPositions()
 
     def constraint_test(self, conf: Chem.rdchem.Conformer) -> bool:
         """
@@ -565,37 +572,37 @@ class ConformerEnsemble:
         bool
             True if the conformer passes the constraint test, False otherwise.
         """
-        # Get the 3D coordinates of the atoms in the conformer
+        # Only the interatomic distances change between attempts; the scaled
+        # van der Waals threshold matrix (self._vdw_matrix) is constant for the
+        # molecule and is precomputed once in _setup_constraint_test.
         coords = conf.GetPositions()
-        # Calculate the distance matrix between all pairs of atoms
         dist_matrix = distance_matrix(coords, coords)
-        # Get the van der Waals radii for each atom in the conformer
-        vdw_radii = [
-            PeriodicTable.GetRvdw(Chem.GetPeriodicTable(), atom.GetAtomicNum())
-            for atom in self.conformer.mol.GetAtoms()
-        ]
-        # Make a matrix of the van der Waals radii
-        vdw_matrix = np.array(
+        # Fail if any non-bonded pair is closer than 1/4 of its summed vdW radii.
+        # Bonded pairs and the diagonal carry a zero threshold so they always pass.
+        return not np.any(dist_matrix < self._vdw_matrix)
+
+    def _setup_constraint_test(self) -> None:
+        """Precompute the constant van der Waals threshold matrix for constraint_test.
+
+        Builds the matrix of summed vdW radii (scaled by 1/4), with bonded pairs
+        and the diagonal zeroed so they are ignored. This is constant for the
+        molecule, so building it once here avoids rebuilding an O(N^2) matrix on
+        every constraint_test call (up to max_attempts times per Monte Carlo step).
+        """
+        periodic_table = Chem.GetPeriodicTable()
+        vdw_radii = np.array(
             [
-                [vdw_radii[i] + vdw_radii[j] for j in range(len(vdw_radii))]
-                for i in range(len(vdw_radii))
+                PeriodicTable.GetRvdw(periodic_table, atom.GetAtomicNum())
+                for atom in self.conformer.mol.GetAtoms()
             ]
         )
-        vdw_matrix = vdw_matrix / 4.0  # Scale the van der Waals radii by 1/4
-        # Set the distances between bonded atoms to zero (to ignore them in the test)
-        for bonded_atom_pair in self.conformer.bonded_atoms:
-            i, j = bonded_atom_pair
+        vdw_matrix = (vdw_radii[:, None] + vdw_radii[None, :]) / 4.0
+        # Bonded pairs and self-distances get a zero threshold (always pass).
+        for i, j in self.conformer.bonded_atoms:
             vdw_matrix[i][j] = 0.0
             vdw_matrix[j][i] = 0.0
-        # Set the diagonal of the van der Waals matrix to zero (to ignore self-distances)
         np.fill_diagonal(vdw_matrix, 0.0)
-        # Check if the distance between any two non-bonded atoms is less than 1/4 of the van der Waals radius
-        difference_matrix = dist_matrix - vdw_matrix
-        # If any distance is less than 0, the conformer fails the constraint test
-        if np.any(difference_matrix < 0):
-            return False
-        # If all distances are greater than or equal to 0, the conformer passes the constraint test
-        return True
+        self._vdw_matrix = vdw_matrix
 
     def _setup_rmsd_comparison(self) -> None:
         """Precompute the atom set and template molecules for duplicate-detection RMSD.
@@ -664,6 +671,25 @@ class ConformerEnsemble:
             self._rmsd_probe, self._rmsd_ref, atomMap=self._rmsd_full_map
         )
 
+    def _rmsd_verdict(self, conf, reference_conf, threshold):
+        """Classify a candidate against one reference by RMSD (and enantiomer).
+
+        Returns ``(verdict, rmsd, inv_rmsd)`` where verdict is "duplicate" (direct
+        RMSD below threshold), "enantiomer" (only the mirror image is below
+        threshold, when detect_enantiomers is on), or "distinct". inv_rmsd is the
+        inverted-overlay RMSD when it was computed, else None. Shared by the crest
+        and rmsd uniqueness methods, which differ only in threshold and logging.
+        """
+        rmsd = self._pairwise_rmsd(conf, reference_conf)
+        if rmsd < threshold:
+            return "duplicate", rmsd, None
+        if self.detect_enantiomers:
+            inv_rmsd = self._pairwise_rmsd(conf, reference_conf, invert=True)
+            if inv_rmsd < threshold:
+                return "enantiomer", rmsd, inv_rmsd
+            return "distinct", rmsd, inv_rmsd
+        return "distinct", rmsd, None
+
     def check_conformer(
         self,
         ensemble: List[np.ndarray],
@@ -719,7 +745,9 @@ class ConformerEnsemble:
             self.log_info("  rejected: connectivity changed (identity check failed)")
             return False
         if self.uniqueness_method == "crest":
-            masses = self.conformer.atoms.get_masses()
+            if self._masses is None:
+                self._masses = self.conformer.atoms.get_masses()
+            masses = self._masses
             candidate_rot = cheminformatics.rotational_constants(conf, masses)
             for idx, (reference_conf, reference_energy) in enumerate(
                 zip(ensemble, energies)
@@ -751,49 +779,47 @@ class ConformerEnsemble:
                             f"rot |dB|max={rot_max:.4f} mismatch -> distinct"
                         )
                     continue
-                rmsd = self._pairwise_rmsd(conf, reference_conf)
-                if rmsd < self.rthr:
+                verdict, rmsd, inv_rmsd = self._rmsd_verdict(
+                    conf, reference_conf, self.rthr
+                )
+                prefix = f"  vs #{idx}: dE={delta_e:.4f} < ethr, rot match, "
+                if verdict == "duplicate":
                     self.log_info(
-                        f"  vs #{idx}: dE={delta_e:.4f} < ethr, rot match, "
-                        f"rmsd={rmsd:.4f} < rthr {self.rthr} -> DUPLICATE"
+                        f"{prefix}rmsd={rmsd:.4f} < rthr {self.rthr} -> DUPLICATE"
                     )
                     self._duplicate_index = idx
                     return False
-                if self.detect_enantiomers:
-                    inv_rmsd = self._pairwise_rmsd(conf, reference_conf, invert=True)
-                    if inv_rmsd < self.rthr:
-                        self.log_info(
-                            f"  vs #{idx}: dE={delta_e:.4f} < ethr, rot match, "
-                            f"rmsd={rmsd:.4f} >= rthr but inverted "
-                            f"rmsd={inv_rmsd:.4f} < rthr {self.rthr} -> ENANTIOMER"
-                        )
-                        self._duplicate_index = idx
-                        return False
+                if verdict == "enantiomer":
+                    self.log_info(
+                        f"{prefix}rmsd={rmsd:.4f} >= rthr but inverted "
+                        f"rmsd={inv_rmsd:.4f} < rthr {self.rthr} -> ENANTIOMER"
+                    )
+                    self._duplicate_index = idx
+                    return False
                 self.log_info(
-                    f"  vs #{idx}: dE={delta_e:.4f} < ethr, rot match, "
-                    f"rmsd={rmsd:.4f} >= rthr {self.rthr} -> distinct"
+                    f"{prefix}rmsd={rmsd:.4f} >= rthr {self.rthr} -> distinct"
                 )
             self.log_info("  accepted: distinct from all members")
             return True
         for idx, reference_conf in enumerate(ensemble):
-            rmsd = self._pairwise_rmsd(conf, reference_conf)
-            if rmsd < self.rmsd_threshold:
+            verdict, rmsd, inv_rmsd = self._rmsd_verdict(
+                conf, reference_conf, self.rmsd_threshold
+            )
+            if verdict == "duplicate":
                 self.log_info(
                     f"  vs #{idx}: rmsd={rmsd:.4f} < threshold "
                     f"{self.rmsd_threshold} -> DUPLICATE"
                 )
                 self._duplicate_index = idx
                 return False
-            if self.detect_enantiomers:
-                inv_rmsd = self._pairwise_rmsd(conf, reference_conf, invert=True)
-                if inv_rmsd < self.rmsd_threshold:
-                    self.log_info(
-                        f"  vs #{idx}: rmsd={rmsd:.4f} >= threshold but inverted "
-                        f"rmsd={inv_rmsd:.4f} < threshold "
-                        f"{self.rmsd_threshold} -> ENANTIOMER"
-                    )
-                    self._duplicate_index = idx
-                    return False
+            if verdict == "enantiomer":
+                self.log_info(
+                    f"  vs #{idx}: rmsd={rmsd:.4f} >= threshold but inverted "
+                    f"rmsd={inv_rmsd:.4f} < threshold "
+                    f"{self.rmsd_threshold} -> ENANTIOMER"
+                )
+                self._duplicate_index = idx
+                return False
             self.log_info(
                 f"  vs #{idx}: rmsd={rmsd:.4f} >= threshold "
                 f"{self.rmsd_threshold} -> distinct"
